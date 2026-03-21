@@ -3,6 +3,25 @@ name: Build Stock Kernel & Modules (OnePlus 9 Pro - Android 14)
 on:
   workflow_dispatch:
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DIRECTORY LAYOUT (mimics the AOSP workspace OnePlus uses internally)
+#
+#  $GITHUB_WORKSPACE/              ← workspace root
+#  ├── vendor/                     ← symlink → vendor_modules/vendor/
+#  ├── vendor_modules/             ← android_kernel_modules_and_devicetree repo
+#  └── kernel_source/              ← YOUR kernel fork
+#      └── kernel/
+#          └── sched_assist        ← git symlink → ../../vendor/oplus/...
+#                                    resolves to workspace root/vendor/oplus/...
+#
+# The kernel source has git-tracked symlinks (mode 120000) that point to code
+# living in the vendor modules repo using relative "../" paths. Those paths only
+# resolve correctly when both repos are laid out in the same directory structure
+# that OnePlus uses in their internal AOSP tree. The step "Repair broken symlinks"
+# recreates any that are still broken by scanning for their targets inside
+# vendor_modules/ automatically — no hardcoded paths needed.
+# ─────────────────────────────────────────────────────────────────────────────
+
 jobs:
   build-kernel:
     runs-on: ubuntu-22.04
@@ -11,9 +30,41 @@ jobs:
     steps:
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 1 — Clone YOUR kernel fork
-    # Defconfig already committed at:
-    #   arch/arm64/configs/vendor/lahaina-qgki_defconfig
+    # STEP 1 — Clone vendor modules + device tree FIRST
+    # Must be cloned before kernel source so the vendor/ symlink is in place
+    # before git restores the kernel source symlinks.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone vendor modules and device tree
+      run: |
+        git clone \
+          --depth=1 \
+          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git \
+          $GITHUB_WORKSPACE/vendor_modules
+
+        echo "vendor_modules tree (top 2 levels):"
+        ls $GITHUB_WORKSPACE/vendor_modules/
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/ 2>/dev/null || true
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 2 — Create vendor/ symlink at workspace root
+    # The kernel source symlinks resolve relative to the workspace root.
+    # e.g. kernel/sched_assist -> ../../vendor/oplus/kernel/cpu/sched/sched_assist
+    # resolves to:  $GITHUB_WORKSPACE/vendor/oplus/kernel/cpu/sched/sched_assist
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Create workspace vendor symlink
+      run: |
+        # Point workspace root /vendor → vendor_modules/vendor
+        ln -sfn $GITHUB_WORKSPACE/vendor_modules/vendor $GITHUB_WORKSPACE/vendor
+
+        echo "Workspace layout:"
+        ls -la $GITHUB_WORKSPACE/
+        echo ""
+        echo "vendor/ contents (top level):"
+        ls $GITHUB_WORKSPACE/vendor/ 2>/dev/null || echo "(empty or broken)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 3 — Clone YOUR kernel fork
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone kernel source
       run: |
@@ -24,20 +75,92 @@ jobs:
           $GITHUB_WORKSPACE/kernel_source
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2 — Clone OnePlus vendor modules + device tree
+    # STEP 4 — Repair any broken symlinks
+    #
+    # Even with the vendor/ symlink in place, some symlinks may still be broken
+    # if the relative depth differs (e.g. drivers/ symlinks go deeper).
+    # This step:
+    #   1. Lists every symlink in the kernel source
+    #   2. Skips ones that already resolve (good)
+    #   3. For broken ones: strips leading "../" from the target and searches
+    #      for the matching path inside vendor_modules/
+    #   4. Replaces the broken symlink with an absolute path to the real files
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Clone vendor modules and device tree
+    - name: Repair broken symlinks
       run: |
-        git clone \
-          --depth=1 \
-          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
-          https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git \
-          $GITHUB_WORKSPACE/vendor_modules
+        KERNEL=$GITHUB_WORKSPACE/kernel_source
+        VENDOR_MODULES=$GITHUB_WORKSPACE/vendor_modules
+
+        echo "=== Scanning for broken symlinks ==="
+        BROKEN=0
+        FIXED=0
+        UNFIXED=0
+
+        while IFS= read -r link; do
+          # Skip symlinks that already resolve
+          if [ -e "$link" ]; then
+            continue
+          fi
+
+          BROKEN=$((BROKEN + 1))
+          target=$(readlink "$link")
+          echo "BROKEN: $link -> $target"
+
+          # Strip leading "../" sequences to get the relative sub-path
+          # e.g. "../../vendor/oplus/kernel/cpu/sched/sched_assist"
+          #   -> "vendor/oplus/kernel/cpu/sched/sched_assist"
+          clean=$(echo "$target" | sed 's|^\(\.\./\)*||')
+
+          # First try: path directly inside vendor_modules
+          candidate="$VENDOR_MODULES/$clean"
+          if [ -e "$candidate" ]; then
+            ln -sfn "$candidate" "$link"
+            echo "  FIXED  -> $candidate"
+            FIXED=$((FIXED + 1))
+            continue
+          fi
+
+          # Second try: only the part after "vendor/"
+          sub=$(echo "$clean" | sed 's|^vendor/||')
+          candidate2="$VENDOR_MODULES/vendor/$sub"
+          if [ -e "$candidate2" ]; then
+            ln -sfn "$candidate2" "$link"
+            echo "  FIXED  -> $candidate2"
+            FIXED=$((FIXED + 1))
+            continue
+          fi
+
+          # Last resort: find by directory name inside vendor_modules
+          dirname=$(basename "$target")
+          found=$(find "$VENDOR_MODULES" -type d -name "$dirname" 2>/dev/null | head -1)
+          if [ -n "$found" ]; then
+            ln -sfn "$found" "$link"
+            echo "  FIXED (by name) -> $found"
+            FIXED=$((FIXED + 1))
+            continue
+          fi
+
+          echo "  UNFIXED (no match found)"
+          UNFIXED=$((UNFIXED + 1))
+
+        done < <(find "$KERNEL" -type l)
+
+        echo ""
+        echo "=== Symlink repair summary ==="
+        echo "  Broken:  $BROKEN"
+        echo "  Fixed:   $FIXED"
+        echo "  Unfixed: $UNFIXED"
+
+        # Fail if critical Kconfig symlinks are still broken
+        if [ -L "$KERNEL/kernel/sched_assist" ] && [ ! -e "$KERNEL/kernel/sched_assist" ]; then
+          echo "FATAL: kernel/sched_assist is still broken!"
+          echo "vendor_modules structure:"
+          find $VENDOR_MODULES -name "sched_assist" -type d 2>/dev/null
+          exit 1
+        fi
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 3 — Install build dependencies
-    # All package names verified for Ubuntu 22.04 (jammy).
-    # Pure-Clang build (CONFIG_GCC_VERSION=0) — no gcc cross-compiler needed.
+    # STEP 5 — Install build dependencies
     # ══════════════════════════════════════════════════════════════════════════
     - name: Install build dependencies
       run: |
@@ -60,76 +183,51 @@ jobs:
           binutils-aarch64-linux-gnu
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Download Clang r383902b1
-    #
-    # ROOT CAUSE OF PREVIOUS FAILURES:
-    #   1. ZyCromerZ has NO Clang 11 release — 404
-    #   2. Previous AOSP URL used wrong branch 'android11-release' — 404
-    #   3. git sparse-checkout with --depth=1 --sparse only fetches root files;
-    #      a separate 'git checkout' is needed to actually pull directory blobs
-    #
-    # SOLUTION — two-stage approach:
-    #   PRIMARY:  Direct tarball from googlesource using the CONFIRMED correct
-    #             branch 'android11-qpr2-release' (verified via googlesource UI)
-    #             URL: .../+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz
-    #
-    #   FALLBACK: git sparse-checkout with the corrected sequence:
-    #             clone with --no-checkout, then set sparse paths, then checkout
+    # STEP 6 — Download Clang r383902b1
+    # Confirmed URL: android11-qpr2-release branch, direct tgz from googlesource
     # ══════════════════════════════════════════════════════════════════════════
     - name: Download Clang r383902b1
       run: |
         mkdir -p $GITHUB_WORKSPACE/toolchain/clang
 
-        # ── Primary: googlesource direct tarball (correct branch confirmed) ──
         TARBALL_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz"
 
-        echo "=== Attempt 1: googlesource tarball (android11-qpr2-release) ==="
+        echo "Downloading Clang r383902b1..."
         curl -fL --retry 3 --retry-delay 10 --max-time 600 \
           "$TARBALL_URL" \
           -o /tmp/clang.tar.gz \
           && CLANG_OK=1 || CLANG_OK=0
 
         if [ "$CLANG_OK" = "1" ]; then
-          echo "Download succeeded. Extracting..."
+          echo "Extracting..."
           tar -xf /tmp/clang.tar.gz -C $GITHUB_WORKSPACE/toolchain/clang
         else
-          # ── Fallback: git sparse-checkout (corrected sequence) ─────────────
-          echo "=== Attempt 2: git sparse-checkout from AOSPA mirror ==="
-          rm -rf $GITHUB_WORKSPACE/toolchain/clang_repo
-
+          echo "Primary URL failed — using git sparse-checkout fallback..."
           git clone \
             --filter=blob:none \
             --no-checkout \
             --depth=1 \
             https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
             $GITHUB_WORKSPACE/toolchain/clang_repo
-
           cd $GITHUB_WORKSPACE/toolchain/clang_repo
           git sparse-checkout init --cone
           git sparse-checkout set clang-r383902b1
           git checkout HEAD
-
-          # The bin/ folder is now inside clang-r383902b1/ subdirectory
           cp -r $GITHUB_WORKSPACE/toolchain/clang_repo/clang-r383902b1/. \
                 $GITHUB_WORKSPACE/toolchain/clang/
         fi
 
-        # ── Verify ────────────────────────────────────────────────────────────
-        echo "Contents of toolchain/clang:"
-        ls $GITHUB_WORKSPACE/toolchain/clang/
-
         if [ ! -f "$GITHUB_WORKSPACE/toolchain/clang/bin/clang" ]; then
-          echo "ERROR: bin/clang not found! Directory tree:"
-          find $GITHUB_WORKSPACE/toolchain/clang -maxdepth 3 | head -40
+          echo "ERROR: bin/clang not found!"
+          find $GITHUB_WORKSPACE/toolchain/clang -maxdepth 3 | head -30
           exit 1
         fi
 
-        echo "=== Clang version ==="
         $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version
         echo "CLANG_BIN_DIR=$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_ENV
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Generate kernel .config from defconfig
+    # STEP 7 — Generate .config from defconfig
     # ══════════════════════════════════════════════════════════════════════════
     - name: Generate .config from defconfig
       working-directory: ${{ github.workspace }}/kernel_source
@@ -143,11 +241,12 @@ jobs:
           LLVM=1 \
           LLVM_IAS=1 \
           vendor/lahaina-qgki_defconfig
+
         echo "=== Key config options ==="
         grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 6 — Build kernel Image + DTBs
+    # STEP 8 — Build kernel Image + DTBs
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build kernel Image and DTBs
       working-directory: ${{ github.workspace }}/kernel_source
@@ -161,6 +260,7 @@ jobs:
           LLVM=1 \
           LLVM_IAS=1 \
           Image dtbs 2>&1 | tee $GITHUB_WORKSPACE/build.log
+
         if [ ! -f out/arch/arm64/boot/Image ]; then
           echo "BUILD FAILED — last 80 lines:"
           tail -80 $GITHUB_WORKSPACE/build.log
@@ -170,7 +270,7 @@ jobs:
         du -h out/arch/arm64/boot/Image
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 7 — Build in-tree kernel modules
+    # STEP 9 — Build in-tree kernel modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build in-tree kernel modules
       working-directory: ${{ github.workspace }}/kernel_source
@@ -187,7 +287,7 @@ jobs:
         echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 8 — Build out-of-tree vendor modules
+    # STEP 10 — Build out-of-tree vendor modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build vendor modules
       run: |
@@ -214,7 +314,7 @@ jobs:
         echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9 — Collect DTB blobs
+    # STEP 11 — Collect DTB blobs
     # ══════════════════════════════════════════════════════════════════════════
     - name: Collect DTB blobs
       run: |
@@ -224,8 +324,7 @@ jobs:
         echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10 — Prepare AnyKernel3
-    # anykernel.sh written with printf to avoid YAML heredoc parsing issues
+    # STEP 12 — Prepare AnyKernel3
     # ══════════════════════════════════════════════════════════════════════════
     - name: Prepare AnyKernel3
       run: |
@@ -265,7 +364,7 @@ jobs:
           > $GITHUB_WORKSPACE/anykernel/anykernel.sh
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 11 — Assemble flashable package
+    # STEP 13 — Assemble flashable package
     # ══════════════════════════════════════════════════════════════════════════
     - name: Assemble flashable package
       run: |
@@ -289,7 +388,7 @@ jobs:
         echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 12 — Create flashable ZIP
+    # STEP 14 — Create flashable ZIP
     # ══════════════════════════════════════════════════════════════════════════
     - name: Create flashable ZIP
       run: |
@@ -303,7 +402,7 @@ jobs:
         du -h $GITHUB_WORKSPACE/$ZIP_NAME
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 13 — Upload artifacts
+    # STEP 15 — Upload artifacts
     # ══════════════════════════════════════════════════════════════════════════
     - name: Upload flashable kernel ZIP
       uses: actions/upload-artifact@v4
