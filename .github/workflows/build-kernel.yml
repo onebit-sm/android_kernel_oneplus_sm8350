@@ -47,21 +47,13 @@ jobs:
         ls $GITHUB_WORKSPACE/vendor_modules/vendor/ 2>/dev/null || true
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2 — Create vendor/ symlink at workspace root
-    # The kernel source symlinks resolve relative to the workspace root.
-    # e.g. kernel/sched_assist -> ../../vendor/oplus/kernel/cpu/sched/sched_assist
-    # resolves to:  $GITHUB_WORKSPACE/vendor/oplus/kernel/cpu/sched/sched_assist
+    # STEP 2 — Create workspace/ vendor symlink (AOSP layout)
     # ══════════════════════════════════════════════════════════════════════════
     - name: Create workspace vendor symlink
       run: |
-        # Point workspace root /vendor → vendor_modules/vendor
         ln -sfn $GITHUB_WORKSPACE/vendor_modules/vendor $GITHUB_WORKSPACE/vendor
-
-        echo "Workspace layout:"
-        ls -la $GITHUB_WORKSPACE/
-        echo ""
-        echo "vendor/ contents (top level):"
-        ls $GITHUB_WORKSPACE/vendor/ 2>/dev/null || echo "(empty or broken)"
+        echo "vendor/ top-level contents:"
+        ls $GITHUB_WORKSPACE/vendor/ 2>/dev/null || echo "(empty)"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 3 — Clone YOUR kernel fork
@@ -75,89 +67,137 @@ jobs:
           $GITHUB_WORKSPACE/kernel_source
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Repair any broken symlinks
+    # STEP 4 — Setup AOSP workspace layout + fix all symlinks
     #
-    # Even with the vendor/ symlink in place, some symlinks may still be broken
-    # if the relative depth differs (e.g. drivers/ symlinks go deeper).
-    # This step:
-    #   1. Lists every symlink in the kernel source
-    #   2. Skips ones that already resolve (good)
-    #   3. For broken ones: strips leading "../" from the target and searches
-    #      for the matching path inside vendor_modules/
-    #   4. Replaces the broken symlink with an absolute path to the real files
+    # WHY THIS IS NEEDED:
+    #   OnePlus ships the kernel source with git-tracked symlinks that assume
+    #   an AOSP workspace where:
+    #     - kernel source lives at:  workspace/kernel/msm-5.4/
+    #     - vendor modules live at:  workspace/vendor/
+    #
+    #   The slabtrace.h driver does:
+    #     #include <../../../../kernel/msm-5.4/mm/internal.h>
+    #
+    #   Clang resolves the real path of slabtrace.h (through the
+    #   drivers/soc/oplus/system symlink) to:
+    #     workspace/vendor/oplus/kernel/system/slabtrace/slabtrace.h
+    #   Going up 4 levels → workspace/vendor/
+    #   Then + kernel/msm-5.4/mm/internal.h
+    #   = workspace/vendor/kernel/msm-5.4/mm/internal.h   ← MUST EXIST
+    #
+    #   Fix: create workspace/vendor/kernel/msm-5.4/ → kernel_source
+    #        create workspace/kernel/msm-5.4/ → kernel_source  (for other paths)
+    #
+    # SYMLINK STRATEGY (from official OnePlus build guide):
+    #   drivers/soc/oplus/{boot,dfr,dft,power,system,cpu,...} are set manually
+    #   using 5-level-up relative paths (../../../../../vendor/oplus/kernel/X)
+    #   so Clang's real-path resolution lands in workspace/vendor/oplus/kernel/X
+    #   and from there the 4-level include path correctly finds
+    #   workspace/vendor/kernel/msm-5.4/mm/internal.h via our new symlink.
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Repair broken symlinks
+    - name: Setup AOSP workspace layout and fix symlinks
       run: |
         KERNEL=$GITHUB_WORKSPACE/kernel_source
-        VENDOR_MODULES=$GITHUB_WORKSPACE/vendor_modules
+        VENDOR=$GITHUB_WORKSPACE/vendor
+        VENDOR_OPLUS_KERNEL=$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel
 
-        echo "=== Scanning for broken symlinks ==="
-        BROKEN=0
+        # ── 1. AOSP-compatible workspace paths ────────────────────────────────
+        # workspace/kernel/msm-5.4/ → kernel source
+        mkdir -p $GITHUB_WORKSPACE/kernel
+        ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/kernel/msm-5.4
+
+        # workspace/vendor/kernel/msm-5.4/ → kernel source
+        # CRITICAL: this is what slabtrace.h's include path resolves to
+        mkdir -p $GITHUB_WORKSPACE/vendor/kernel
+        ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/vendor/kernel/msm-5.4
+
+        echo "Workspace layout:"
+        ls -la $GITHUB_WORKSPACE/
+
+        # ── 2. drivers/soc/oplus sub-symlinks (from OnePlus build guide) ──────
+        # These replace any broken git symlinks with correct absolute targets.
+        # Each oplus sub-driver lives in vendor/oplus/kernel/<name>/
+        mkdir -p $KERNEL/drivers/soc/oplus
+
+        for subdir in boot dfr dft power system cpu; do
+          target="$VENDOR_OPLUS_KERNEL/$subdir"
+          if [ -d "$target" ]; then
+            ln -sfn "$target" "$KERNEL/drivers/soc/oplus/$subdir"
+            echo "  drivers/soc/oplus/$subdir -> $target"
+          fi
+        done
+
+        # ── 3. include/soc/oplus sub-symlinks ─────────────────────────────────
+        mkdir -p $KERNEL/include/soc/oplus
+
+        for subdir in boot dft; do
+          target="$VENDOR_OPLUS_KERNEL/$subdir/include"
+          if [ -d "$target" ]; then
+            ln -sfn "$target" "$KERNEL/include/soc/oplus/$subdir"
+            echo "  include/soc/oplus/$subdir -> $target"
+          fi
+        done
+
+        # ── 4. kernel/ sub-symlinks (sched_assist etc.) ───────────────────────
+        mkdir -p $KERNEL/kernel
+
+        for subdir in sched_assist oplus_performance; do
+          target=$(find $VENDOR_OPLUS_KERNEL -maxdepth 4 -type d -name "$subdir" 2>/dev/null | head -1)
+          if [ -n "$target" ]; then
+            ln -sfn "$target" "$KERNEL/kernel/$subdir"
+            echo "  kernel/$subdir -> $target"
+          fi
+        done
+
+        # ── 5. Generic broken-symlink repair for anything remaining ───────────
+        echo ""
+        echo "=== Generic symlink repair scan ==="
         FIXED=0
         UNFIXED=0
 
         while IFS= read -r link; do
-          # Skip symlinks that already resolve
-          if [ -e "$link" ]; then
-            continue
-          fi
+          [ -e "$link" ] && continue   # already resolves, skip
 
-          BROKEN=$((BROKEN + 1))
-          target=$(readlink "$link")
-          echo "BROKEN: $link -> $target"
+          raw_target=$(readlink "$link")
+          clean=$(echo "$raw_target" | sed 's|^\(\.\./\)*||')
 
-          # Strip leading "../" sequences to get the relative sub-path
-          # e.g. "../../vendor/oplus/kernel/cpu/sched/sched_assist"
-          #   -> "vendor/oplus/kernel/cpu/sched/sched_assist"
-          clean=$(echo "$target" | sed 's|^\(\.\./\)*||')
+          # Try path inside vendor_modules
+          for candidate in \
+            "$GITHUB_WORKSPACE/vendor_modules/$clean" \
+            "$GITHUB_WORKSPACE/vendor_modules/vendor/$(echo "$clean" | sed 's|^vendor/||')" \
+            "$(find $GITHUB_WORKSPACE/vendor_modules -type d -name "$(basename "$raw_target")" 2>/dev/null | head -1)"
+          do
+            if [ -n "$candidate" ] && [ -e "$candidate" ]; then
+              ln -sfn "$candidate" "$link"
+              FIXED=$((FIXED + 1))
+              break
+            fi
+          done
 
-          # First try: path directly inside vendor_modules
-          candidate="$VENDOR_MODULES/$clean"
-          if [ -e "$candidate" ]; then
-            ln -sfn "$candidate" "$link"
-            echo "  FIXED  -> $candidate"
-            FIXED=$((FIXED + 1))
-            continue
-          fi
-
-          # Second try: only the part after "vendor/"
-          sub=$(echo "$clean" | sed 's|^vendor/||')
-          candidate2="$VENDOR_MODULES/vendor/$sub"
-          if [ -e "$candidate2" ]; then
-            ln -sfn "$candidate2" "$link"
-            echo "  FIXED  -> $candidate2"
-            FIXED=$((FIXED + 1))
-            continue
-          fi
-
-          # Last resort: find by directory name inside vendor_modules
-          dirname=$(basename "$target")
-          found=$(find "$VENDOR_MODULES" -type d -name "$dirname" 2>/dev/null | head -1)
-          if [ -n "$found" ]; then
-            ln -sfn "$found" "$link"
-            echo "  FIXED (by name) -> $found"
-            FIXED=$((FIXED + 1))
-            continue
-          fi
-
-          echo "  UNFIXED (no match found)"
-          UNFIXED=$((UNFIXED + 1))
-
+          [ -e "$link" ] || UNFIXED=$((UNFIXED + 1))
         done < <(find "$KERNEL" -type l)
 
-        echo ""
-        echo "=== Symlink repair summary ==="
-        echo "  Broken:  $BROKEN"
-        echo "  Fixed:   $FIXED"
-        echo "  Unfixed: $UNFIXED"
+        echo "  Additional fixed: $FIXED  |  Still unfixed: $UNFIXED"
 
-        # Fail if critical Kconfig symlinks are still broken
-        if [ -L "$KERNEL/kernel/sched_assist" ] && [ ! -e "$KERNEL/kernel/sched_assist" ]; then
-          echo "FATAL: kernel/sched_assist is still broken!"
-          echo "vendor_modules structure:"
-          find $VENDOR_MODULES -name "sched_assist" -type d 2>/dev/null
-          exit 1
-        fi
+        # ── 6. Critical path check ─────────────────────────────────────────────
+        echo ""
+        echo "=== Critical path checks ==="
+        for check in \
+          "kernel/sched_assist" \
+          "drivers/soc/oplus/system"
+        do
+          path="$KERNEL/$check"
+          if [ -L "$path" ] && [ ! -e "$path" ]; then
+            echo "FATAL: $check is still broken!"
+            exit 1
+          else
+            echo "  OK: $check"
+          fi
+        done
+
+        echo ""
+        echo "vendor/kernel/msm-5.4 check:"
+        ls $GITHUB_WORKSPACE/vendor/kernel/msm-5.4/mm/internal.h && echo "  OK: include path target exists" || echo "  WARN: mm/internal.h not found"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Install build dependencies
