@@ -1,0 +1,276 @@
+name: Build Stock Kernel & Modules (OnePlus 9 Pro - Android 14)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1 — Clone YOUR kernel fork
+    # The defconfig is already committed at:
+    #   arch/arm64/configs/vendor/lahaina-qgki_defconfig
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone kernel source
+      run: |
+        git clone \
+          --depth=1 \
+          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://github.com/onebit-sm/android_kernel_oneplus_sm8350.git \
+          $GITHUB_WORKSPACE/kernel_source
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 2 — Clone OnePlus vendor modules + device tree
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone vendor modules and device tree
+      run: |
+        git clone \
+          --depth=1 \
+          --branch oneplus/sm8350_u_14.0.0_oneplus9 \
+          https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git \
+          $GITHUB_WORKSPACE/vendor_modules
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 3 — Install build dependencies
+    # All package names verified for Ubuntu 22.04 (jammy).
+    # Pure-Clang build — gcc cross-compiler is NOT needed.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          bc \
+          bison \
+          build-essential \
+          ccache \
+          curl \
+          flex \
+          git \
+          libelf-dev \
+          libssl-dev \
+          lz4 \
+          make \
+          python3 \
+          zip \
+          zlib1g-dev \
+          binutils-aarch64-linux-gnu
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 4 — Download Clang r383902b1 (GitHub mirror — fast & reliable)
+    # Exact version baked into device config:
+    #   clang version 11.0.2 ... r383902b1
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Download Clang 11 (r383902b1)
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/toolchain/clang
+        CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/11.0.2-r383902b1/Clang-11.0.2-r383902b1.tar.gz"
+        echo "Downloading Clang r383902b1..."
+        curl -fL --retry 5 --retry-delay 10 "$CLANG_URL" -o /tmp/clang.tar.gz
+        echo "Extracting..."
+        tar -xf /tmp/clang.tar.gz -C $GITHUB_WORKSPACE/toolchain/clang
+        CLANG_BIN=$(find $GITHUB_WORKSPACE/toolchain/clang -name "clang" -type f | head -1)
+        if [ -z "$CLANG_BIN" ]; then
+          echo "ERROR: clang binary not found after extraction!"
+          ls -la $GITHUB_WORKSPACE/toolchain/clang
+          exit 1
+        fi
+        CLANG_DIR=$(dirname "$CLANG_BIN")
+        echo "Clang location: $CLANG_DIR"
+        "$CLANG_BIN" --version
+        echo "CLANG_BIN_DIR=$CLANG_DIR" >> $GITHUB_ENV
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 5 — Generate kernel .config from defconfig
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Generate .config from defconfig
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          vendor/lahaina-qgki_defconfig
+        echo "=== Key config options ==="
+        grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 6 — Build kernel Image + DTBs
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build kernel Image and DTBs
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          Image dtbs 2>&1 | tee $GITHUB_WORKSPACE/build.log
+        if [ ! -f out/arch/arm64/boot/Image ]; then
+          echo "BUILD FAILED — last 80 lines:"
+          tail -80 $GITHUB_WORKSPACE/build.log
+          exit 1
+        fi
+        echo "=== Kernel Image built ==="
+        du -h out/arch/arm64/boot/Image
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 7 — Build in-tree kernel modules
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build in-tree kernel modules
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          modules
+        echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 8 — Build out-of-tree vendor modules
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build vendor modules
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        BUILT=0
+        for mod_dir in $GITHUB_WORKSPACE/vendor_modules/*/; do
+          if [ -f "$mod_dir/Kbuild" ] || [ -f "$mod_dir/Makefile" ]; then
+            echo "Building: $mod_dir"
+            make -j$(nproc --all) \
+              -C $GITHUB_WORKSPACE/kernel_source/out \
+              M="$mod_dir" \
+              ARCH=arm64 \
+              CC=clang \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              LLVM=1 \
+              LLVM_IAS=1 \
+              KERNEL_SRC=$GITHUB_WORKSPACE/kernel_source \
+              modules || echo "Warning: failed in $mod_dir (continuing)"
+            BUILT=$((BUILT + 1))
+          fi
+        done
+        echo "Vendor dirs attempted: $BUILT"
+        echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9 — Collect DTB blobs
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Collect DTB blobs
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/dtbs
+        find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
+          -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
+        echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 10 — Prepare AnyKernel3
+    # anykernel.sh is written with printf to avoid YAML heredoc conflicts.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Prepare AnyKernel3
+      run: |
+        git clone --depth=1 \
+          https://github.com/osm0sis/AnyKernel3.git \
+          $GITHUB_WORKSPACE/anykernel
+
+        rm -f $GITHUB_WORKSPACE/anykernel/Image \
+              $GITHUB_WORKSPACE/anykernel/zImage \
+              $GITHUB_WORKSPACE/anykernel/Image.gz \
+              $GITHUB_WORKSPACE/anykernel/Image.gz-dtb \
+              $GITHUB_WORKSPACE/anykernel/dtb \
+              $GITHUB_WORKSPACE/anykernel/dtbo.img
+
+        printf '%s\n' \
+          '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14' \
+          '' \
+          'kernel.string=Stock Base Kernel - OnePlus 9 Pro (Android 14)' \
+          'do.devicecheck=1' \
+          'do.modules=1' \
+          'do.systemless=1' \
+          'do.cleanup=1' \
+          'do.cleanuponabort=0' \
+          '' \
+          'device.name1=lemonadep' \
+          'device.name2=lemonade' \
+          'device.name3=OnePlus9Pro' \
+          'device.name4=' \
+          'device.name5=' \
+          '' \
+          'supported.versions=14' \
+          '' \
+          '. tools/ak3-core.sh' \
+          '' \
+          'split_boot' \
+          'flash_boot' \
+          > $GITHUB_WORKSPACE/anykernel/anykernel.sh
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 11 — Assemble flashable package
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Assemble flashable package
+      run: |
+        AK=$GITHUB_WORKSPACE/anykernel
+
+        cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
+        echo "Kernel Image: OK"
+
+        DTB_COUNT=$(find $GITHUB_WORKSPACE/dtbs -name "*.dtb" 2>/dev/null | wc -l)
+        if [ "$DTB_COUNT" -gt "0" ]; then
+          mkdir -p $AK/dtbs
+          cp $GITHUB_WORKSPACE/dtbs/*.dtb $AK/dtbs/
+          echo "DTBs copied: $DTB_COUNT"
+        fi
+
+        mkdir -p $AK/modules/vendor/lib/modules
+        find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" \
+          -exec cp {} $AK/modules/vendor/lib/modules/ \;
+        find $GITHUB_WORKSPACE/vendor_modules -name "*.ko" \
+          -exec cp {} $AK/modules/vendor/lib/modules/ \;
+        echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 12 — Create flashable ZIP
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Create flashable ZIP
+      run: |
+        ZIP_NAME="Stock-Base-OP9Pro-$(date +%Y%m%d-%H%M).zip"
+        cd $GITHUB_WORKSPACE/anykernel
+        zip -r9 $GITHUB_WORKSPACE/$ZIP_NAME . \
+          --exclude=".git/*" \
+          --exclude="README.md" \
+          --exclude="*placeholder"
+        echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+        du -h $GITHUB_WORKSPACE/$ZIP_NAME
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 13 — Upload artifacts
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Upload flashable kernel ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: Stock-Base-Kernel-OP9Pro
+        path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+        retention-days: 30
+
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: ${{ github.workspace }}/build.log
+        retention-days: 7
