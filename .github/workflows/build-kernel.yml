@@ -102,17 +102,32 @@ jobs:
         VENDOR_OPLUS_KERNEL=$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel
 
         # ── 1. AOSP-compatible workspace paths ────────────────────────────────
-        # workspace/kernel/msm-5.4/ → kernel source
+        # workspace/kernel/msm-5.4/ → kernel source (used by some relative includes)
         mkdir -p $GITHUB_WORKSPACE/kernel
         ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/kernel/msm-5.4
 
-        # workspace/vendor/kernel/msm-5.4/ → kernel source
-        # CRITICAL: this is what slabtrace.h's include path resolves to
-        mkdir -p $GITHUB_WORKSPACE/vendor/kernel
-        ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/vendor/kernel/msm-5.4
+        # vendor_modules/vendor/kernel/msm-5.4/ → kernel source
+        #
+        # CRITICAL FIX — WHY THIS PATH AND NOT vendor/kernel/msm-5.4:
+        #   vendor/ is a symlink to vendor_modules/vendor/.
+        #   drivers/soc/oplus/system symlink points to an ABSOLUTE path:
+        #     $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel/system/
+        #   Clang resolves real path of slabtrace.h through that absolute path.
+        #   Going 4 dirs up from slabtrace/ reaches vendor_modules/vendor/.
+        #   So Clang looks for:
+        #     $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h
+        #   Writing through the vendor symlink is unreliable — we write DIRECTLY.
+        mkdir -p $GITHUB_WORKSPACE/vendor_modules/vendor/kernel
+        ln -sfn $GITHUB_WORKSPACE/kernel_source \
+                $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4
 
         echo "Workspace layout:"
         ls -la $GITHUB_WORKSPACE/
+        echo "Critical include path check:"
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h \
+          && echo "  OK: vendor_modules/vendor/kernel/msm-5.4/mm/internal.h EXISTS" \
+          || echo "  ERROR: mm/internal.h MISSING"
+        echo "  kernel/msm-5.4 → $(readlink $GITHUB_WORKSPACE/kernel/msm-5.4 2>/dev/null || echo MISSING)" 
 
         # ── 2. drivers/soc/oplus sub-symlinks (from OnePlus build guide) ──────
         # These replace any broken git symlinks with correct absolute targets.
@@ -196,8 +211,8 @@ jobs:
         done
 
         echo ""
-        echo "vendor/kernel/msm-5.4 check:"
-        ls $GITHUB_WORKSPACE/vendor/kernel/msm-5.4/mm/internal.h && echo "  OK: include path target exists" || echo "  WARN: mm/internal.h not found"
+        echo "vendor_modules/vendor/kernel/msm-5.4 check:"
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h && echo "  OK: include path target exists" || echo "  WARN: mm/internal.h not found"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Install build dependencies
@@ -349,8 +364,13 @@ jobs:
           Image 2>&1 | tee $GITHUB_WORKSPACE/build.log
 
         if [ ! -f out/arch/arm64/boot/Image ]; then
-          echo "BUILD FAILED — last 80 lines:"
-          tail -80 $GITHUB_WORKSPACE/build.log
+          echo ""
+          echo "══════════ BUILD FAILED ══════════"
+          echo "--- Compiler errors (grep fatal/error) ---"
+          grep -E "fatal error:|error:" $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -40 || true
+          echo ""
+          echo "--- Last 60 lines of build.log ---"
+          tail -60 $GITHUB_WORKSPACE/build.log
           exit 1
         fi
         echo "=== Kernel Image built ==="
