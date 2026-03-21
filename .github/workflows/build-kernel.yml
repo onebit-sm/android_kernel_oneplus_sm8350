@@ -12,7 +12,7 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 1 — Clone YOUR kernel fork
-    # The defconfig is already committed at:
+    # Defconfig already committed at:
     #   arch/arm64/configs/vendor/lahaina-qgki_defconfig
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone kernel source
@@ -60,48 +60,73 @@ jobs:
           binutils-aarch64-linux-gnu
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Download Clang r383902b1 via git sparse-checkout
+    # STEP 4 — Download Clang r383902b1
     #
-    # WHY SPARSE CHECKOUT:
-    #   - ZyCromerZ has NO Clang 11 release (minimum is Clang 13) — 404
-    #   - android.googlesource.com tarball URLs are unreliable in CI
-    #   - The full prebuilts repo is 30 GB+ — way too large
+    # ROOT CAUSE OF PREVIOUS FAILURES:
+    #   1. ZyCromerZ has NO Clang 11 release — 404
+    #   2. Previous AOSP URL used wrong branch 'android11-release' — 404
+    #   3. git sparse-checkout with --depth=1 --sparse only fetches root files;
+    #      a separate 'git checkout' is needed to actually pull directory blobs
     #
-    # SOLUTION: git sparse-checkout on the AOSPA GitHub mirror.
-    #   This fetches ONLY the clang-r383902b1 folder (~450 MB of binaries),
-    #   skipping all other clang versions entirely.
+    # SOLUTION — two-stage approach:
+    #   PRIMARY:  Direct tarball from googlesource using the CONFIRMED correct
+    #             branch 'android11-qpr2-release' (verified via googlesource UI)
+    #             URL: .../+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz
     #
-    # SOURCE: https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86
-    #   This is a verified GitHub mirror of AOSP's official prebuilts repo
-    #   and contains clang-r383902b1 (Android R-QPR2 release, Clang 11.0.2).
+    #   FALLBACK: git sparse-checkout with the corrected sequence:
+    #             clone with --no-checkout, then set sparse paths, then checkout
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Download Clang r383902b1 (sparse checkout)
+    - name: Download Clang r383902b1
       run: |
-        mkdir -p $GITHUB_WORKSPACE/toolchain
+        mkdir -p $GITHUB_WORKSPACE/toolchain/clang
 
-        echo "Initialising sparse clone of AOSP Clang prebuilts mirror..."
-        git clone \
-          --depth=1 \
-          --filter=blob:none \
-          --sparse \
-          https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
-          $GITHUB_WORKSPACE/toolchain/clang_repo
+        # ── Primary: googlesource direct tarball (correct branch confirmed) ──
+        TARBALL_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-qpr2-release/clang-r383902b1.tar.gz"
 
-        cd $GITHUB_WORKSPACE/toolchain/clang_repo
+        echo "=== Attempt 1: googlesource tarball (android11-qpr2-release) ==="
+        curl -fL --retry 3 --retry-delay 10 --max-time 600 \
+          "$TARBALL_URL" \
+          -o /tmp/clang.tar.gz \
+          && CLANG_OK=1 || CLANG_OK=0
 
-        echo "Enabling sparse checkout for clang-r383902b1 only..."
-        git sparse-checkout set clang-r383902b1
+        if [ "$CLANG_OK" = "1" ]; then
+          echo "Download succeeded. Extracting..."
+          tar -xf /tmp/clang.tar.gz -C $GITHUB_WORKSPACE/toolchain/clang
+        else
+          # ── Fallback: git sparse-checkout (corrected sequence) ─────────────
+          echo "=== Attempt 2: git sparse-checkout from AOSPA mirror ==="
+          rm -rf $GITHUB_WORKSPACE/toolchain/clang_repo
 
-        echo "Verifying Clang binary..."
-        CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang_repo/clang-r383902b1/bin/clang"
-        if [ ! -f "$CLANG_BIN" ]; then
-          echo "ERROR: clang binary not found at expected path!"
-          ls -la $GITHUB_WORKSPACE/toolchain/clang_repo/
+          git clone \
+            --filter=blob:none \
+            --no-checkout \
+            --depth=1 \
+            https://github.com/AOSPA/android_prebuilts_clang_host_linux-x86.git \
+            $GITHUB_WORKSPACE/toolchain/clang_repo
+
+          cd $GITHUB_WORKSPACE/toolchain/clang_repo
+          git sparse-checkout init --cone
+          git sparse-checkout set clang-r383902b1
+          git checkout HEAD
+
+          # The bin/ folder is now inside clang-r383902b1/ subdirectory
+          cp -r $GITHUB_WORKSPACE/toolchain/clang_repo/clang-r383902b1/. \
+                $GITHUB_WORKSPACE/toolchain/clang/
+        fi
+
+        # ── Verify ────────────────────────────────────────────────────────────
+        echo "Contents of toolchain/clang:"
+        ls $GITHUB_WORKSPACE/toolchain/clang/
+
+        if [ ! -f "$GITHUB_WORKSPACE/toolchain/clang/bin/clang" ]; then
+          echo "ERROR: bin/clang not found! Directory tree:"
+          find $GITHUB_WORKSPACE/toolchain/clang -maxdepth 3 | head -40
           exit 1
         fi
 
-        "$CLANG_BIN" --version
-        echo "CLANG_BIN_DIR=$GITHUB_WORKSPACE/toolchain/clang_repo/clang-r383902b1/bin" >> $GITHUB_ENV
+        echo "=== Clang version ==="
+        $GITHUB_WORKSPACE/toolchain/clang/bin/clang --version
+        echo "CLANG_BIN_DIR=$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_ENV
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Generate kernel .config from defconfig
@@ -200,7 +225,7 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Prepare AnyKernel3
-    # anykernel.sh written with printf to avoid YAML heredoc conflicts
+    # anykernel.sh written with printf to avoid YAML heredoc parsing issues
     # ══════════════════════════════════════════════════════════════════════════
     - name: Prepare AnyKernel3
       run: |
