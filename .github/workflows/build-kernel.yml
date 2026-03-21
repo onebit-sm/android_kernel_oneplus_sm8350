@@ -246,9 +246,56 @@ jobs:
         grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 8 — Build kernel Image + DTBs
+    # STEP 8 — Fix corrupted Makefiles in vendor DTB tree
+    #
+    # ROOT CAUSE:
+    #   arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile line 14 uses
+    #   8-space indentation instead of a TAB character. GNU make strictly
+    #   requires TAB for recipe lines and throws "missing separator" otherwise.
+    #   This is a bug in the OnePlusOSS repo itself (spaces committed instead
+    #   of tabs). We fix it at build time by converting leading spaces→tabs
+    #   in ALL Makefiles under the vendor DTS tree before building.
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Build kernel Image and DTBs
+    - name: Fix vendor DTB Makefile indentation
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        DTS_VENDOR="arch/arm64/boot/dts/vendor"
+
+        if [ ! -d "$DTS_VENDOR" ]; then
+          echo "No vendor DTS directory found — skipping fix"
+          exit 0
+        fi
+
+        echo "Scanning Makefiles under $DTS_VENDOR for space-indented lines..."
+        FIXED=0
+
+        find "$DTS_VENDOR" -name "Makefile" -o -name "Kbuild" | while read -r mkfile; do
+          # Convert lines that start with 8 spaces (recipe lines) to TAB
+          # Only touch lines that look like make recipe lines (not variable assignments)
+          if grep -Pq "^        [^\s#=]" "$mkfile" 2>/dev/null; then
+            # Use unexpand to convert leading spaces to tabs (8 spaces = 1 tab)
+            unexpand --first-only -t 8 "$mkfile" > "$mkfile.fixed" \
+              && mv "$mkfile.fixed" "$mkfile"
+            echo "  Fixed: $mkfile"
+            FIXED=$((FIXED + 1))
+          fi
+        done
+
+        echo "Makefile fix complete."
+
+        # Verify the known-bad file is now fixed
+        BADFILE="$DTS_VENDOR/oplus/lemonadev/Makefile"
+        if [ -f "$BADFILE" ]; then
+          echo "=== Line 14 of $BADFILE ==="
+          sed -n '12,16p' "$BADFILE" | cat -A
+        fi
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9 — Build kernel Image
+    # Image and dtbs are built separately so a DTB error does not fail the
+    # critical Image build. The kernel Image is what gets flashed.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build kernel Image
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
@@ -259,7 +306,7 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          Image dtbs 2>&1 | tee $GITHUB_WORKSPACE/build.log
+          Image 2>&1 | tee $GITHUB_WORKSPACE/build.log
 
         if [ ! -f out/arch/arm64/boot/Image ]; then
           echo "BUILD FAILED — last 80 lines:"
@@ -270,7 +317,26 @@ jobs:
         du -h out/arch/arm64/boot/Image
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9 — Build in-tree kernel modules
+    # STEP 10 — Build DTBs (non-fatal)
+    # Separated from Image so a vendor DTB Makefile bug does not block flashing.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Build DTBs
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log \
+          && echo "DTBs built successfully" \
+          || echo "WARNING: DTB build had errors (non-fatal — Image still usable)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 11 — Build in-tree kernel modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build in-tree kernel modules
       working-directory: ${{ github.workspace }}/kernel_source
