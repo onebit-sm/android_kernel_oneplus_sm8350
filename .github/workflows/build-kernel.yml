@@ -510,6 +510,11 @@ jobs:
           '// a module. These stubs allow vmlinux to link when display is =m.' \
           '//' \
           '// __weak means a built-in display driver (=y) automatically wins.' \
+          '//' \
+          '// EXPORT_SYMBOL_GPL is required here (not just for vmlinux linkage)' \
+          '// because loadable modules such as uff_fp_driver.ko also reference' \
+          '// msm_drm_register_client at module load time. Without the export,' \
+          '// modpost raises "undefined symbol" and the .ko cannot be loaded.' \
           '' \
           '#include <linux/module.h>' \
           '#include <linux/notifier.h>' \
@@ -518,21 +523,25 @@ jobs:
           '{' \
           '	return 0;' \
           '}' \
+          'EXPORT_SYMBOL_GPL(msm_drm_register_client);' \
           '' \
           'int __weak msm_drm_unregister_client(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
+          'EXPORT_SYMBOL_GPL(msm_drm_unregister_client);' \
           '' \
           'int __weak register_lcdinfo_notifier(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
+          'EXPORT_SYMBOL_GPL(register_lcdinfo_notifier);' \
           '' \
           'int __weak unregister_lcdinfo_notifier(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
+          'EXPORT_SYMBOL_GPL(unregister_lcdinfo_notifier);' \
           > "$STUB_DIR/display_notifier_stubs.c"
 
         printf '%s\n' \
@@ -554,7 +563,8 @@ jobs:
         echo ""
         echo "=== drivers/Makefile tail (verify hook) ==="
         tail -5 drivers/Makefile
-
+    
+    
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9c — Fix fingerprint driver include path
     #
