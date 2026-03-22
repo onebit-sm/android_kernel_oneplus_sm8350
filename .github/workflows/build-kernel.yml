@@ -130,10 +130,39 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone techpack/audio
       run: |
-        git clone           --depth=1           --branch oneplus/sm8350_u_14.0.0_oneplus9           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_audio_kernel_sm8350.git           $GITHUB_WORKSPACE/kernel_source/techpack/audio
+        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/audio
 
-        echo "techpack/audio cloned:"
-        ls $GITHUB_WORKSPACE/kernel_source/techpack/audio/
+        # Check if already present as a valid symlink inside kernel tree
+        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
+          echo "techpack/audio already present — skipping clone"
+          ls "$TECHPACK_DEST"
+          exit 0
+        fi
+
+        # Check if audio-kernel is bundled inside vendor_modules
+        VM_AUDIO=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5 \
+          \( -name "audio-kernel" -o -name "audio_kernel" \) -type d 2>/dev/null | head -1)
+        if [ -n "$VM_AUDIO" ] && [ -f "$VM_AUDIO/Makefile" ]; then
+          echo "Found audio kernel inside vendor_modules: $VM_AUDIO"
+          ln -sfn "$VM_AUDIO" "$TECHPACK_DEST"
+          exit 0
+        fi
+
+        # Clone default branch — OnePlusOSS never published an Android 14 branch
+        # for this repo. The default branch has SM8350 audio drivers that are
+        # compatible across OxygenOS 11-14 (audio kernel API is SoC-stable).
+        echo "Cloning techpack/audio (default branch)..."
+        git clone --depth=1 \
+          https://github.com/OnePlusOSS/android_vendor_qcom_opensource_audio_kernel_sm8350.git \
+          "$TECHPACK_DEST"
+
+        if [ ! -f "$TECHPACK_DEST/Makefile" ]; then
+          echo "ERROR: Makefile missing after clone!"
+          ls "$TECHPACK_DEST"
+          exit 1
+        fi
+        echo "Cloned at commit: $(git -C $TECHPACK_DEST log --oneline -1)"
+        ls "$TECHPACK_DEST" 
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Fix CRLF line endings in Kconfig files
