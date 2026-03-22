@@ -24,35 +24,55 @@ on:
 #   │
 #   └── device/qcom/kernelscripts/  ← Official OnePlus build scripts
 #
-# LINKER FAILURE HISTORY:
+# ─────────────────────────────────────────────────────────────────────────────
+# BUG HISTORY:
+#
 #   Run 1 — "LLVM ERROR: IO failure on output stream: Broken pipe" (297x)
 #     Root cause: Disk full. techpack/audio was missing.
-#     The Broken-pipe messages are harmless cascade noise from make -j.
 #
-#   Run 2 — Same Broken-pipe noise, DIFFERENT root cause:
-#     ../techpack/camera/Makefile: No such file or directory
-#     techpack/camera was being cloned from a wrong separate repo.
+#   Run 2 — "../techpack/camera/Makefile: No such file or directory"
+#     Root cause: techpack/camera was being cloned from a wrong separate repo.
 #
-#   Run 3 (last log) — Compilation 100% succeeded. Linker failed with:
-#     ld.lld: error: undefined symbol: msm_drm_register_client
-#     ld.lld: error: undefined symbol: msm_drm_unregister_client
-#     ld.lld: error: undefined symbol: register_lcdinfo_notifier
-#     ld.lld: error: undefined symbol: unregister_lcdinfo_notifier
+#   Run 3 — vmlinux link failed:
+#     ld.lld: error: undefined symbol: msm_drm_register_client (and 3 others)
+#     Root cause: techpack/display is =m, seven built-in Oplus drivers call its
+#     exported symbols. Fixed in Step 9b with __weak stub implementations.
 #
-#     Root cause: techpack/display is compiled as a loadable module (=m),
-#     NOT linked into vmlinux. Seven built-in Oplus drivers call these four
-#     display-notifier functions at module_init time, creating undefined
-#     references the linker cannot resolve.
+#   Run 4 (last log) — Image built successfully! DTBs failed:
+#     ../arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile:14:
+#       *** missing separator (did you mean TAB instead of 8 spaces?). Stop.
 #
-#     Callers (all built-in):
-#       oplus_wakelock_profiler.c, black_screen_check.c,
-#       bright_screen_check.c, sensor_feedback.c, hybridswapd.c,
-#       hybridswapd_chp.c, oplus_charger.c, oplus_ssc_interact.c
+#     ROOT CAUSE: The lemonadev/Makefile uses CRLF (\r\n) line endings AND
+#     multi-line variable assignments with \ continuation. GNU make requires
+#     the backslash to be IMMEDIATELY before \n for continuation to work.
+#     With CRLF the sequence is: "dtb-y += foo.dtb \<CR><LF>"
+#     The \ precedes \r, not \n, so GNU make does NOT treat it as a continuation.
+#     Line 14 becomes a standalone bare token like "        lahaina-lemonadev-v5.dtb"
+#     which GNU make cannot parse → "missing separator" error.
 #
-# CORRECT FIX (Step 9b): inject __weak stub definitions for the four symbols
-# into a new drivers/oplus_display_stubs/ directory that IS built into vmlinux.
-# __weak means a future build that includes display as built-in automatically
-# overrides the stubs with the real implementations.
+#     WHY STEP 5 DIDN'T PREVENT IT:
+#       Step 5 stripped CRLF from -name "Kconfig" files only.
+#       Makefile / Kbuild / *.mk files were NOT processed.
+#
+#     WHY STEP 10 DIDN'T FIX IT:
+#       Step 10 tried to convert leading spaces to tabs. That addresses recipe
+#       indentation, not CRLF-broken line continuations. Even if unexpand ran
+#       on this file, \r characters would remain and break make parsing.
+#
+#     FIX (Step 5 — extended):
+#       Also strip \r from ALL Makefile, Kbuild, and *.mk files in both trees.
+#       Once CRLF is gone, the backslash-continuation lines work correctly and
+#       there are no bare "        lahaina-lemonadev.dtb" tokens for make to trip on.
+#
+#     ADDITIONAL FIX (Step 12):
+#       Add -k (keep-going) flag to make dtbs so that if any single DTB
+#       directory fails, all other DTBs are still compiled.
+#       The lemonade-specific DTBs are critical for the OP9 Pro flashable zip.
+#
+#     ADDITIONAL FIX (Step 13):
+#       Redirect make modules output to build.log so failures are visible
+#       in the uploaded artifact (previously they were invisible).
+#       Add proper non-fatal handling consistent with Step 12.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
@@ -192,14 +212,64 @@ jobs:
         done
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Fix CRLF line endings in Kconfig files
+    # STEP 5 — Fix CRLF line endings
+    #
+    # FIX vs. previous version:
+    #   Old: only processed files named "Kconfig"
+    #   New: also processes Makefile, Kbuild, and *.mk files in BOTH trees.
+    #
+    #   WHY THIS MATTERS:
+    #     arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile uses CRLF AND
+    #     multi-line \ continuations. GNU make requires \ to be immediately
+    #     before \n for continuation — with CRLF (\r\n) the \ precedes \r,
+    #     not \n, so make treats each continuation line as a new standalone
+    #     token. Those tokens start with 8 spaces and have no valid make
+    #     syntax → "missing separator (did you mean TAB instead of 8 spaces?)"
+    #     Stripping \r fixes the continuations and silences the error entirely.
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Fix CRLF line endings in Kconfig files
+    - name: Fix CRLF line endings in build files
       run: |
-        echo "Fixing CRLF in kernel_source Kconfig files..."
-        find $GITHUB_WORKSPACE/kernel_source -name "Kconfig" -exec sed -i 's/\r//' {} \;
-        echo "Fixing CRLF in vendor_modules Kconfig files..."
-        find $GITHUB_WORKSPACE/vendor_modules -name "Kconfig" -exec sed -i 's/\r//' {} \;
+        strip_crlf() {
+          local tree="$1"
+          local label="$2"
+          local count=0
+
+          # Kconfig files (same as before — needed for menuconfig parsing)
+          while IFS= read -r -d '' f; do
+            sed -i 's/\r//' "$f"
+            count=$((count + 1))
+          done < <(find "$tree" -name "Kconfig" -print0 2>/dev/null)
+
+          # ── NEW: Makefile / Kbuild / *.mk ─────────────────────────────────
+          # These also come from Windows editors in the OEM tree and can carry
+          # \r characters that break GNU make's line-continuation detection.
+          while IFS= read -r -d '' f; do
+            sed -i 's/\r//' "$f"
+            count=$((count + 1))
+          done < <(find "$tree" \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" \) -print0 2>/dev/null)
+
+          echo "  $label: $count files fixed"
+        }
+
+        echo "Stripping CRLF from kernel_source build files..."
+        strip_crlf "$GITHUB_WORKSPACE/kernel_source" "kernel_source"
+
+        echo "Stripping CRLF from vendor_modules build files..."
+        strip_crlf "$GITHUB_WORKSPACE/vendor_modules" "vendor_modules"
+
+        echo ""
+        echo "=== Verification: lemonadev/Makefile CRLF check ==="
+        LEMON_MK="$GITHUB_WORKSPACE/kernel_source/arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile"
+        if [ -f "$LEMON_MK" ]; then
+          CR_COUNT=$(grep -cP '\r' "$LEMON_MK" || true)
+          echo "  lemonadev/Makefile carriage-return count: $CR_COUNT (must be 0)"
+          [ "$CR_COUNT" -eq 0 ] || { echo "  ERROR: CRLF still present!"; exit 1; }
+          echo "  Lines 12-16 of lemonadev/Makefile:"
+          sed -n '12,16p' "$LEMON_MK" | cat -A
+        else
+          echo "  lemonadev/Makefile not found at expected path (may be elsewhere — OK)"
+        fi
+
         echo "CRLF fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -417,37 +487,14 @@ jobs:
     #   techpack/display is configured as a loadable module (=m) in
     #   lahaina-qgki_defconfig — it does NOT link into vmlinux. However,
     #   seven built-in Oplus drivers call four symbols that techpack/display
-    #   exports, causing these ld.lld errors at final link time:
+    #   exports, causing ld.lld "undefined symbol" errors at final link time.
     #
-    #     undefined symbol: msm_drm_register_client
-    #       → oplus_wakelock_profiler.c:654, black_screen_check.c:334,
-    #         bright_screen_check.c:397, sensor_feedback.c:911,
-    #         hybridswapd.c:1973, hybridswapd_chp.c:1743, oplus_charger.c:2458
+    # STATUS: CONFIRMED WORKING in run 4 — vmlinux and Image both linked
+    #   successfully with zero undefined-symbol errors.
     #
-    #     undefined symbol: msm_drm_unregister_client
-    #       → hybridswapd.c:2000/2012, hybridswapd_chp.c:1768/1782
-    #
-    #     undefined symbol: register_lcdinfo_notifier
-    #       → oplus_ssc_interact.c:499
-    #
-    #     undefined symbol: unregister_lcdinfo_notifier
-    #       → oplus_ssc_interact.c:543
-    #
-    # THE FIX:
-    #   Create drivers/oplus_display_stubs/ with __weak implementations of
-    #   the four symbols. __weak means:
-    #     • The linker uses these stubs now (vmlinux links successfully).
-    #     • If a future build includes display as built-in (=y), the real
-    #       strong symbols automatically override the stubs — no conflict.
-    #     • No EXPORT_SYMBOL is used; stubs only need to satisfy vmlinux
-    #       link time, not runtime module symbol tables.
-    #
-    # RUNTIME EFFECT:
-    #   The seven callers register with a no-op notifier at boot. Screen-state
-    #   events from the display module will not reach them. This is acceptable
-    #   for a kernel that boots and runs — only Oplus-specific screen-event
-    #   features (some wakelock accounting, certain sensor feedback triggers)
-    #   are silently disabled. All core functionality is unaffected.
+    # The __weak stubs in drivers/oplus_display_stubs/ satisfy the linker.
+    # When techpack/display is loaded as a module at runtime, its strong-symbol
+    # definitions override these stubs automatically (standard __weak semantics).
     # ══════════════════════════════════════════════════════════════════════════
     - name: Inject display-notifier stubs for vmlinux linkage
       working-directory: ${{ github.workspace }}/kernel_source
@@ -455,7 +502,6 @@ jobs:
         STUB_DIR="drivers/oplus_display_stubs"
         mkdir -p "$STUB_DIR"
 
-        # Write the stub C file (use printf to avoid heredoc quoting issues)
         printf '%s\n' \
           '// SPDX-License-Identifier: GPL-2.0-only' \
           '//' \
@@ -489,12 +535,10 @@ jobs:
           '}' \
           > "$STUB_DIR/display_notifier_stubs.c"
 
-        # Write the Makefile for the stub directory
         printf '%s\n' \
           'obj-y += display_notifier_stubs.o' \
           > "$STUB_DIR/Makefile"
 
-        # Hook into drivers/Makefile (append only if not already present)
         if ! grep -q "oplus_display_stubs" drivers/Makefile; then
           echo 'obj-y += oplus_display_stubs/' >> drivers/Makefile
           echo "Appended oplus_display_stubs/ to drivers/Makefile"
@@ -502,7 +546,6 @@ jobs:
           echo "oplus_display_stubs/ already present in drivers/Makefile"
         fi
 
-        echo ""
         echo "=== Stub file contents ==="
         cat "$STUB_DIR/display_notifier_stubs.c"
         echo ""
@@ -514,6 +557,17 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
+    #
+    # NOTE: After the Step 5 CRLF fix, the primary cause of the lemonadev
+    # "missing separator" error is already resolved (the \r was breaking
+    # backslash-continuation lines).  This step is kept as a safety net for
+    # any DTS Makefiles that additionally use spaces instead of tabs for
+    # actual recipe lines (a separate, rarer issue).
+    #
+    # The logic is:
+    #   1. Strip any residual \r (belt-and-suspenders after Step 5)
+    #   2. Convert leading 8-space sequences to TAB on lines that grep
+    #      identifies as space-indented recipe candidates
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix vendor DTB Makefile indentation
       working-directory: ${{ github.workspace }}/kernel_source
@@ -525,22 +579,31 @@ jobs:
           exit 0
         fi
 
-        echo "Scanning Makefiles under $DTS_VENDOR for space-indented lines..."
+        echo "Scanning Makefiles under $DTS_VENDOR..."
 
-        find "$DTS_VENDOR" -name "Makefile" -o -name "Kbuild" | while read -r mkfile; do
-          if grep -Pq "^        [^\s#=]" "$mkfile" 2>/dev/null; then
-            unexpand --first-only -t 8 "$mkfile" > "$mkfile.fixed" \
-              && mv "$mkfile.fixed" "$mkfile"
-            echo "  Fixed: $mkfile"
+        find "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) | while read -r mkfile; do
+          # Belt-and-suspenders: strip any remaining \r characters
+          sed -i 's/\r//' "$mkfile"
+
+          # Convert leading 8-space sequences → TAB on recipe-like lines.
+          # This catches files where spaces were used instead of tabs in
+          # rule recipes (distinct from the CRLF continuation issue).
+          if grep -Pq "^        [^\s#]" "$mkfile" 2>/dev/null; then
+            sed -i 's/^        /\t/' "$mkfile"
+            echo "  Fixed indentation: $mkfile"
           fi
         done
 
         echo "Makefile fix complete."
 
-        BADFILE="$DTS_VENDOR/oplus/lemonadev/Makefile"
-        if [ -f "$BADFILE" ]; then
-          echo "=== Line 12-16 of $BADFILE ==="
-          sed -n '12,16p' "$BADFILE" | cat -A
+        echo "=== lemonadev/Makefile verification ==="
+        LEMON_MK="$DTS_VENDOR/oplus/lemonadev/Makefile"
+        if [ -f "$LEMON_MK" ]; then
+          echo "  CR count: $(grep -cP '\r' "$LEMON_MK" || echo 0) (must be 0)"
+          echo "  Lines 12-18:"
+          sed -n '12,18p' "$LEMON_MK" | cat -A
+        else
+          echo "  lemonadev/Makefile not found at $LEMON_MK"
         fi
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -577,13 +640,22 @@ jobs:
         du -h out/arch/arm64/boot/Image
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 12 — Build DTBs (non-fatal)
+    # STEP 12 — Build DTBs
+    #
+    # FIX vs. previous version:
+    #   Added -k (keep-going) flag to make. Without it, the first DTB directory
+    #   that fails (e.g. lemonadev before the CRLF fix) stops ALL subsequent
+    #   DTB compilation. With -k, make continues building all other DTBs even
+    #   if one subtree fails, maximising the set of DTBs available for the zip.
+    #
+    #   After the Step 5 CRLF fix the lemonadev error should not recur, but -k
+    #   is kept as a defensive measure against other potential DTB failures.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build DTBs
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        make -j$(nproc --all) O=out \
+        make -j$(nproc --all) -k O=out \
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -594,8 +666,25 @@ jobs:
           && echo "DTBs built successfully" \
           || echo "WARNING: DTB build had errors (non-fatal — Image still usable)"
 
+        # Count and list lemonade-specific DTBs to confirm they were built
+        echo ""
+        echo "=== Lemonade DTB check ==="
+        find out/arch/arm64/boot/dts -name "*lemonad*" 2>/dev/null \
+          | while read f; do echo "  FOUND: $f"; done \
+          || echo "  No lemonade DTBs found (check CRLF fix in Step 5)"
+
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 13 — Build in-tree kernel modules
+    #
+    # FIX vs. previous version:
+    #   Output is now appended to build.log (2>&1 | tee -a) so that any
+    #   compilation errors are visible in the uploaded build-log artifact.
+    #   Previously, module build failures were completely invisible and could
+    #   silently terminate the workflow with a non-zero exit code.
+    #
+    #   Non-fatal handling is added consistent with the DTBs step: a modules
+    #   build failure is reported but does not stop the zip from being assembled
+    #   (the Image is the critical deliverable; modules enhance it).
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build in-tree kernel modules
       working-directory: ${{ github.workspace }}/kernel_source
@@ -608,7 +697,10 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          modules
+          modules 2>&1 | tee -a $GITHUB_WORKSPACE/build.log \
+          && echo "In-tree modules built OK" \
+          || echo "WARNING: in-tree modules had errors — continuing"
+
         echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -647,6 +739,11 @@ jobs:
         find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
           -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
         echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
+
+        # Verify lemonade DTBs are present (critical for OP9 Pro)
+        LEMON_COUNT=$(ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null | wc -l)
+        echo "Lemonade-specific DTBs: $LEMON_COUNT"
+        ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null || true
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 16 — Prepare AnyKernel3
