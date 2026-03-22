@@ -4,22 +4,38 @@ on:
   workflow_dispatch:
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DIRECTORY LAYOUT (mimics the AOSP workspace OnePlus uses internally)
+# REPOSITORY LAYOUT (android_kernel_modules_and_devicetree_oneplus_sm8350)
 #
-#  $GITHUB_WORKSPACE/              ← workspace root
-#  ├── vendor/                     ← symlink → vendor_modules/vendor/
-#  ├── vendor_modules/             ← android_kernel_modules_and_devicetree repo
-#  └── kernel_source/              ← YOUR kernel fork
-#      └── kernel/
-#          └── sched_assist        ← git symlink → ../../vendor/oplus/...
-#                                    resolves to workspace root/vendor/oplus/...
+# The vendor_modules repo contains THREE distinct trees, all in one repo:
 #
-# The kernel source has git-tracked symlinks (mode 120000) that point to code
-# living in the vendor modules repo using relative "../" paths. Those paths only
-# resolve correctly when both repos are laid out in the same directory structure
-# that OnePlus uses in their internal AOSP tree. The step "Repair broken symlinks"
-# recreates any that are still broken by scanning for their targets inside
-# vendor_modules/ automatically — no hardcoded paths needed.
+#   vendor_modules/
+#   ├── vendor/oplus/kernel/         ← Oplus kernel feature modules
+#   │   ├── charger/                 (symlinked into kernel_source/drivers/power/oplus_chg)
+#   │   ├── system/                  (symlinked into kernel_source/drivers/soc/oplus/system)
+#   │   ├── touchpanel/              etc.
+#   │   └── ... (15 subdirs total)
+#   │
+#   ├── kernel/msm-5.4/techpack/    ← ALL techpack modules live here, NOT in separate repos
+#   │   ├── audio/                   (Qualcomm audio kernel)
+#   │   ├── camera/                  (Qualcomm camera kernel — THE ROOT CAUSE OF LAST FAILURE)
+#   │   ├── video/                   (Qualcomm video kernel)
+#   │   ├── display/                 (Qualcomm display kernel)
+#   │   └── dataipa/                 (Qualcomm IPA data kernel)
+#   │
+#   └── device/qcom/kernelscripts/  ← Official OnePlus build scripts (build.sh, envsetup.sh etc.)
+#
+# PREVIOUS ERRORS EXPLAINED:
+#   Run 1 — "LLVM ERROR: IO failure on output stream: Broken pipe" (297x)
+#     Root cause: Disk full. techpack/audio was missing from a previous run.
+#     Each "Broken pipe" was cascade noise from make -j killing sibling jobs.
+#
+#   Run 2 (last log) — Same "Broken pipe" errors but DIFFERENT root cause:
+#     ../techpack/camera/Makefile: No such file or directory  ← THE ACTUAL ERROR
+#     The disk fix worked; audio compiled fine. But techpack/camera was still
+#     being cloned from a WRONG separate repo. All techpack dirs live inside
+#     vendor_modules/kernel/msm-5.4/techpack/ — no separate clones needed.
+#
+# CORRECT FIX: symlink all 5 techpack dirs from the already-cloned vendor_modules.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
@@ -32,26 +48,16 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 0 — Free disk space
     #
-    # ROOT CAUSE OF PREVIOUS FAILURE:
-    #   "LLVM ERROR: IO failure on output stream: Broken pipe" = disk full.
-    #   GitHub Actions ubuntu-22.04 runners have only ~14 GB free by default.
-    #   A kernel build with CONFIG_DEBUG_INFO=y generates ~8 GB of .o files
-    #   plus the toolchain (~500 MB) and source repos (~3 GB) = disk exhausted.
-    #
-    # We free ~14 GB by removing pre-installed tools we don't need:
-    #   - Android SDK/NDK     (~8 GB)
-    #   - .NET runtime        (~2 GB)
-    #   - Haskell/GHC         (~2 GB)
-    #   - CodeQL              (~1 GB)
-    #   - Swap is also added to handle peak memory during linking
+    # GitHub Actions ubuntu-22.04 runners have only ~14 GB free by default.
+    # A kernel build with CONFIG_DEBUG_INFO=y generates ~8 GB of .o files
+    # plus the toolchain (~500 MB) and source repos (~3 GB) = disk exhausted.
+    # We free ~14 GB by removing pre-installed tools we don't need.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Free disk space
       run: |
         echo "=== Disk before cleanup ==="
         df -h /
 
-        # Remove large pre-installed components not needed for kernel builds
-        # These are safe to delete — none are used by our build
         sudo rm -rf /usr/share/dotnet          # .NET      ~2 GB
         sudo rm -rf /usr/local/lib/android     # Android   ~8 GB
         sudo rm -rf /opt/ghc                   # Haskell   ~2 GB
@@ -76,13 +82,17 @@ jobs:
 
         echo "=== Disk after cleanup ==="
         df -h /
-        echo "=== Free space available ==="
         df -h / | awk 'NR==2 {print "Available: "$4}'
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 1 — Clone vendor modules + device tree FIRST
-    # Must be cloned before kernel source so the vendor/ symlink is in place
-    # before git restores the kernel source symlinks.
+    # STEP 1 — Clone vendor modules + device tree
+    #
+    # This repo contains:
+    #   vendor/oplus/kernel/        → Oplus feature driver symlink targets
+    #   kernel/msm-5.4/techpack/    → ALL 5 techpack dirs (audio/camera/video/display/dataipa)
+    #   device/qcom/kernelscripts/  → Official build scripts
+    #
+    # MUST be cloned BEFORE kernel source so vendor/ symlinks resolve on checkout.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone vendor modules and device tree
       run: |
@@ -92,21 +102,27 @@ jobs:
           https://github.com/OnePlusOSS/android_kernel_modules_and_devicetree_oneplus_sm8350.git \
           $GITHUB_WORKSPACE/vendor_modules
 
-        echo "vendor_modules tree (top 2 levels):"
+        echo "=== vendor_modules top-level layout ==="
         ls $GITHUB_WORKSPACE/vendor_modules/
-        ls $GITHUB_WORKSPACE/vendor_modules/vendor/ 2>/dev/null || true
+
+        echo "=== Techpack dirs confirmed ==="
+        ls $GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/techpack/
+
+        echo "=== Oplus kernel subdirs ==="
+        ls $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel/ 2>/dev/null || echo "(not found)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 2 — Create workspace/ vendor symlink (AOSP layout)
+    # STEP 2 — Create workspace vendor symlink (AOSP layout)
+    # workspace/vendor/ → vendor_modules/vendor/
     # ══════════════════════════════════════════════════════════════════════════
     - name: Create workspace vendor symlink
       run: |
         ln -sfn $GITHUB_WORKSPACE/vendor_modules/vendor $GITHUB_WORKSPACE/vendor
-        echo "vendor/ top-level contents:"
+        echo "vendor/ → $(readlink $GITHUB_WORKSPACE/vendor)"
         ls $GITHUB_WORKSPACE/vendor/ 2>/dev/null || echo "(empty)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 3 — Clone YOUR kernel fork
+    # STEP 3 — Clone kernel source
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone kernel source
       run: |
@@ -117,154 +133,109 @@ jobs:
           $GITHUB_WORKSPACE/kernel_source
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Clone techpack/audio (Qualcomm audio kernel)
+    # STEP 4 — Symlink all techpack directories
     #
-    # ROOT CAUSE OF PREVIOUS BUILD FAILURE (confirmed from build log):
-    #   ../techpack/audio/Makefile: No such file or directory
-    #   make[2]: *** [techpack/audio] Error 2
+    # ROOT CAUSE OF LAST BUILD FAILURE (confirmed: build.log lines 1794-1797):
+    #   ../techpack/camera/Makefile: No such file or directory
+    #   make[3]: *** No rule to make target '../techpack/camera/Makefile'. Stop.
     #
-    # techpack/audio is a SEPARATE Qualcomm OSS repository that must be cloned
-    # into the kernel tree at techpack/audio/ before building. It is not part
-    # of the main kernel source repo. The 286 "LLVM ERROR: Broken pipe" messages
-    # in the previous log were pure cascade noise from this single missing dir.
+    # ALL 5 techpack subdirs exist in vendor_modules/kernel/msm-5.4/techpack/.
+    # No separate git clones are needed — just symlink from the already-cloned repo.
+    #
+    # The 5 required techpack modules for SM8350 (Lahaina):
+    #   audio    — Qualcomm audio kernel (ADSP, ASoC, WCD codecs, Bolero)
+    #   camera   — Qualcomm camera kernel (IFE, ISP, CSID, CCI, sensor modules)
+    #   video    — Qualcomm video kernel (Venus VIDC H.264/H.265 codec)
+    #   display  — Qualcomm display kernel (SDE, DSI, MDP, DP)
+    #   dataipa  — Qualcomm IPA data path accelerator
+    #
+    # The kernel Makefile at line 1956 iterates techpack/ and requires ALL of
+    # these to have valid Makefiles. Missing any one fails the entire build.
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Clone techpack/audio
+    - name: Symlink all techpack directories from vendor_modules
       run: |
-        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/audio
+        KERNEL=$GITHUB_WORKSPACE/kernel_source
+        TECHPACK_SRC=$GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/techpack
+        TECHPACK_DST=$KERNEL/techpack
 
-        # Check if already present as a valid symlink inside kernel tree
-        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
-          echo "techpack/audio already present — skipping clone"
-          ls "$TECHPACK_DEST"
-          exit 0
-        fi
-
-        # Check if audio-kernel is bundled inside vendor_modules
-        VM_AUDIO=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5 \
-          \( -name "audio-kernel" -o -name "audio_kernel" \) -type d 2>/dev/null | head -1)
-        if [ -n "$VM_AUDIO" ] && [ -f "$VM_AUDIO/Makefile" ]; then
-          echo "Found audio kernel inside vendor_modules: $VM_AUDIO"
-          ln -sfn "$VM_AUDIO" "$TECHPACK_DEST"
-          exit 0
-        fi
-
-        # Clone default branch — OnePlusOSS never published an Android 14 branch
-        # for this repo. The default branch has SM8350 audio drivers that are
-        # compatible across OxygenOS 11-14 (audio kernel API is SoC-stable).
-        echo "Cloning techpack/audio (default branch)..."
-        git clone --depth=1 \
-          https://github.com/OnePlusOSS/android_vendor_qcom_opensource_audio_kernel_sm8350.git \
-          "$TECHPACK_DEST"
-
-        if [ ! -f "$TECHPACK_DEST/Makefile" ]; then
-          echo "ERROR: Makefile missing after clone!"
-          ls "$TECHPACK_DEST"
+        # Verify the source exists before proceeding
+        if [ ! -d "$TECHPACK_SRC" ]; then
+          echo "FATAL: vendor_modules/kernel/msm-5.4/techpack not found!"
+          echo "vendor_modules contents:"
+          ls $GITHUB_WORKSPACE/vendor_modules/
           exit 1
         fi
-        echo "Cloned at commit: $(git -C $TECHPACK_DEST log --oneline -1)"
-        ls "$TECHPACK_DEST" 
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Clone techpack/camera (Qualcomm camera kernel)
-    #
-    # kernel/Makefile:1956 requires techpack/camera — same pattern as audio.
-    # OnePlusOSS publishes this as android_vendor_qcom_opensource_camera-kernel.
-    # No Android 14 branch exists — default branch covers all SM8350 versions.
-    # ══════════════════════════════════════════════════════════════════════════
-    - name: Clone techpack/camera
-      run: |
-        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/camera
+        echo "=== Source techpack contents ==="
+        ls "$TECHPACK_SRC"
 
-        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
-          echo "techpack/camera already present — skipping"
-          exit 0
-        fi
+        # Create destination and symlink each subdir individually
+        mkdir -p "$TECHPACK_DST"
 
-        VM_CAM=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5           \( -name "camera-kernel" -o -name "camera_kernel" \) -type d 2>/dev/null | head -1)
-        if [ -n "$VM_CAM" ] && [ -f "$VM_CAM/Makefile" ]; then
-          echo "Found camera kernel in vendor_modules: $VM_CAM"
-          ln -sfn "$VM_CAM" "$TECHPACK_DEST"
-          exit 0
-        fi
+        LINKED=0
+        FAILED=0
+        for subdir in audio camera video display dataipa; do
+          src="$TECHPACK_SRC/$subdir"
+          dst="$TECHPACK_DST/$subdir"
 
-        echo "Cloning techpack/camera (default branch)..."
-        git clone --depth=1           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_camera-kernel.git           "$TECHPACK_DEST"
+          if [ -d "$src" ] && [ -f "$src/Makefile" ]; then
+            # Remove any stale symlink or dir from git checkout
+            rm -rf "$dst"
+            ln -sfn "$src" "$dst"
+            echo "  OK: techpack/$subdir → $src"
+            LINKED=$((LINKED + 1))
+          else
+            echo "  MISSING: techpack/$subdir not found or has no Makefile at $src"
+            FAILED=$((FAILED + 1))
+          fi
+        done
 
-        if [ ! -f "$TECHPACK_DEST/Makefile" ]; then
-          echo "ERROR: Makefile missing after clone!"
-          ls "$TECHPACK_DEST"
+        echo ""
+        echo "Linked: $LINKED / 5    Failed: $FAILED"
+
+        # Hard fail if any required techpack dir is missing
+        if [ "$FAILED" -gt "0" ]; then
+          echo "FATAL: $FAILED techpack dir(s) are missing — build will fail at make[3]"
           exit 1
         fi
-        echo "Cloned at: $(git -C $TECHPACK_DEST log --oneline -1)"
+
+        # Final verification — check every Makefile is reachable through the symlink
+        echo ""
+        echo "=== Makefile reachability check ==="
+        for subdir in audio camera video display dataipa; do
+          if [ -f "$TECHPACK_DST/$subdir/Makefile" ]; then
+            echo "  PASS: techpack/$subdir/Makefile"
+          else
+            echo "  FAIL: techpack/$subdir/Makefile not reachable!"
+            exit 1
+          fi
+        done
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 6 — Clone techpack/video (Qualcomm video kernel)
+    # STEP 5 — Fix CRLF line endings in Kconfig files
     #
-    # Pre-emptively cloned — kernel/Makefile references techpack/video
-    # alongside audio and camera. Same pattern, same reasoning.
-    # ══════════════════════════════════════════════════════════════════════════
-    - name: Clone techpack/video
-      run: |
-        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/video
-
-        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
-          echo "techpack/video already present — skipping"
-          exit 0
-        fi
-
-        VM_VID=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5           \( -name "video-driver" -o -name "video_kernel" \) -type d 2>/dev/null | head -1)
-        if [ -n "$VM_VID" ] && [ -f "$VM_VID/Makefile" ]; then
-          echo "Found video kernel in vendor_modules: $VM_VID"
-          ln -sfn "$VM_VID" "$TECHPACK_DEST"
-          exit 0
-        fi
-
-        echo "Cloning techpack/video (default branch)..."
-        git clone --depth=1           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_video-driver-sm8350.git           "$TECHPACK_DEST"           || echo "WARNING: video-driver clone failed (non-fatal if not required)"
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 7 — Fix CRLF line endings in Kconfig files
-    #
-    # 69 warnings found in build log:
-    #   drivers/soc/oplus/system/cmdline_parser/Kconfig: CRLF line endings
-    # Windows-style \r\n endings in Kconfig files cause "unexpected character"
-    # warnings and can break parsing on strict Kconfig versions. Fix all of them.
+    # Windows-style \r\n in Kconfig files cause parse warnings and can break
+    # strict Kconfig versions. The vendor_modules repo ships some with CRLF.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix CRLF line endings in Kconfig files
       run: |
-        echo "Fixing CRLF in Kconfig files..."
+        echo "Fixing CRLF in kernel_source Kconfig files..."
         find $GITHUB_WORKSPACE/kernel_source -name "Kconfig" -exec sed -i 's/\r//' {} \;
+        echo "Fixing CRLF in vendor_modules Kconfig files..."
         find $GITHUB_WORKSPACE/vendor_modules -name "Kconfig" -exec sed -i 's/\r//' {} \;
         echo "CRLF fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 6 — Setup AOSP workspace layout + fix all symlinks
+    # STEP 6 — Setup AOSP workspace layout and fix symlinks
     #
     # WHY THIS IS NEEDED:
-    #   OnePlus ships the kernel source with git-tracked symlinks that assume
-    #   an AOSP workspace where:
-    #     - kernel source lives at:  workspace/kernel/msm-5.4/
-    #     - vendor modules live at:  workspace/vendor/
-    #
-    #   The slabtrace.h driver does:
-    #     #include <../../../../kernel/msm-5.4/mm/internal.h>
-    #
-    #   Clang resolves the real path of slabtrace.h (through the
-    #   drivers/soc/oplus/system symlink) to:
-    #     workspace/vendor/oplus/kernel/system/slabtrace/slabtrace.h
-    #   Going up 4 levels → workspace/vendor/
-    #   Then + kernel/msm-5.4/mm/internal.h
-    #   = workspace/vendor/kernel/msm-5.4/mm/internal.h   ← MUST EXIST
-    #
-    #   Fix: create workspace/vendor/kernel/msm-5.4/ → kernel_source
-    #        create workspace/kernel/msm-5.4/ → kernel_source  (for other paths)
-    #
-    # SYMLINK STRATEGY (from official OnePlus build guide):
-    #   drivers/soc/oplus/{boot,dfr,dft,power,system,cpu,...} are set manually
-    #   using 5-level-up relative paths (../../../../../vendor/oplus/kernel/X)
-    #   so Clang's real-path resolution lands in workspace/vendor/oplus/kernel/X
-    #   and from there the 4-level include path correctly finds
-    #   workspace/vendor/kernel/msm-5.4/mm/internal.h via our new symlink.
+    #   The kernel source has git-tracked symlinks that assume an AOSP workspace:
+    #     workspace/vendor/oplus/kernel/<subsystem>/
+    #   Clang resolves real paths through these symlinks. The slabtrace driver
+    #   uses a 4-level-up include that resolves to:
+    #     workspace/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h
+    #   We create that path by symlinking vendor_modules/vendor/kernel/msm-5.4/
+    #   → kernel_source.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Setup AOSP workspace layout and fix symlinks
       run: |
@@ -273,21 +244,13 @@ jobs:
         VENDOR_OPLUS_KERNEL=$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel
 
         # ── 1. AOSP-compatible workspace paths ────────────────────────────────
-        # workspace/kernel/msm-5.4/ → kernel source (used by some relative includes)
         mkdir -p $GITHUB_WORKSPACE/kernel
         ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/kernel/msm-5.4
 
-        # vendor_modules/vendor/kernel/msm-5.4/ → kernel source
-        #
-        # CRITICAL FIX — WHY THIS PATH AND NOT vendor/kernel/msm-5.4:
-        #   vendor/ is a symlink to vendor_modules/vendor/.
-        #   drivers/soc/oplus/system symlink points to an ABSOLUTE path:
-        #     $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel/system/
-        #   Clang resolves real path of slabtrace.h through that absolute path.
-        #   Going 4 dirs up from slabtrace/ reaches vendor_modules/vendor/.
-        #   So Clang looks for:
-        #     $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h
-        #   Writing through the vendor symlink is unreliable — we write DIRECTLY.
+        # CRITICAL: vendor_modules/vendor/kernel/msm-5.4/ → kernel source
+        # Clang's real-path resolution for slabtrace.h goes 4 dirs up from
+        # vendor_modules/vendor/oplus/kernel/system/slabtrace/ and then needs
+        # + kernel/msm-5.4/mm/internal.h  →  must write DIRECTLY, not via symlink
         mkdir -p $GITHUB_WORKSPACE/vendor_modules/vendor/kernel
         ln -sfn $GITHUB_WORKSPACE/kernel_source \
                 $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4
@@ -298,11 +261,8 @@ jobs:
         ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h \
           && echo "  OK: vendor_modules/vendor/kernel/msm-5.4/mm/internal.h EXISTS" \
           || echo "  ERROR: mm/internal.h MISSING"
-        echo "  kernel/msm-5.4 → $(readlink $GITHUB_WORKSPACE/kernel/msm-5.4 2>/dev/null || echo MISSING)" 
 
-        # ── 2. drivers/soc/oplus sub-symlinks (from OnePlus build guide) ──────
-        # These replace any broken git symlinks with correct absolute targets.
-        # Each oplus sub-driver lives in vendor/oplus/kernel/<name>/
+        # ── 2. drivers/soc/oplus sub-symlinks ────────────────────────────────
         mkdir -p $KERNEL/drivers/soc/oplus
 
         for subdir in boot dfr dft power system cpu; do
@@ -313,7 +273,7 @@ jobs:
           fi
         done
 
-        # ── 3. include/soc/oplus sub-symlinks ─────────────────────────────────
+        # ── 3. include/soc/oplus sub-symlinks ────────────────────────────────
         mkdir -p $KERNEL/include/soc/oplus
 
         for subdir in boot dft; do
@@ -324,7 +284,7 @@ jobs:
           fi
         done
 
-        # ── 4. kernel/ sub-symlinks (sched_assist etc.) ───────────────────────
+        # ── 4. kernel/ sub-symlinks (sched_assist etc.) ────────────────────
         mkdir -p $KERNEL/kernel
 
         for subdir in sched_assist oplus_performance; do
@@ -335,19 +295,18 @@ jobs:
           fi
         done
 
-        # ── 5. Generic broken-symlink repair for anything remaining ───────────
+        # ── 5. Generic broken-symlink repair ─────────────────────────────────
         echo ""
         echo "=== Generic symlink repair scan ==="
         FIXED=0
         UNFIXED=0
 
         while IFS= read -r link; do
-          [ -e "$link" ] && continue   # already resolves, skip
+          [ -e "$link" ] && continue
 
           raw_target=$(readlink "$link")
           clean=$(echo "$raw_target" | sed 's|^\(\.\./\)*||')
 
-          # Try path inside vendor_modules
           for candidate in \
             "$GITHUB_WORKSPACE/vendor_modules/$clean" \
             "$GITHUB_WORKSPACE/vendor_modules/vendor/$(echo "$clean" | sed 's|^vendor/||')" \
@@ -365,25 +324,31 @@ jobs:
 
         echo "  Additional fixed: $FIXED  |  Still unfixed: $UNFIXED"
 
-        # ── 6. Critical path check ─────────────────────────────────────────────
+        # ── 6. Critical path checks ───────────────────────────────────────────
         echo ""
         echo "=== Critical path checks ==="
+        ALL_OK=1
         for check in \
           "kernel/sched_assist" \
-          "drivers/soc/oplus/system"
+          "drivers/soc/oplus/system" \
+          "techpack/audio" \
+          "techpack/camera" \
+          "techpack/video" \
+          "techpack/display" \
+          "techpack/dataipa"
         do
           path="$KERNEL/$check"
           if [ -L "$path" ] && [ ! -e "$path" ]; then
-            echo "FATAL: $check is still broken!"
-            exit 1
-          else
+            echo "  FATAL: $check is still broken!"
+            ALL_OK=0
+          elif [ -e "$path" ]; then
             echo "  OK: $check"
+          else
+            echo "  WARN: $check does not exist (may be optional)"
           fi
         done
 
-        echo ""
-        echo "vendor_modules/vendor/kernel/msm-5.4 check:"
-        ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h && echo "  OK: include path target exists" || echo "  WARN: mm/internal.h not found"
+        [ "$ALL_OK" = "1" ] || exit 1
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7 — Install build dependencies
@@ -410,7 +375,7 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
-    # Confirmed URL: android11-qpr2-release branch, direct tgz from googlesource
+    # The exact toolchain version OnePlus used for SM8350 OxygenOS 14 builds.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Download Clang r383902b1
       run: |
@@ -471,22 +436,8 @@ jobs:
         echo "=== Key config options ==="
         grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
 
-        # ── Disable DEBUG_INFO to save ~6 GB of disk space ─────────────────
-        # CONFIG_DEBUG_INFO=y makes every .o file carry DWARF symbols → 20+ GB.
-        # The kernel Image does NOT include debug info — disabling is safe.
-        #
-        # Correct scripts/config syntax:
-        #   --disable X   → # CONFIG_X is not set
-        #   --enable X    → CONFIG_X=y
-        #   --set-val X n → CONFIG_X=n  (only for int/hex, NOT bool)
-        #
-        # Kernel 5.4 debug info Kconfig uses a "choice" block:
-        #   DEBUG_INFO (master switch)
-        #   DEBUG_INFO_NONE / DEBUG_INFO_REDUCED / DEBUG_INFO_DWARF4 (sub-choice)
-        # We must disable the master switch to suppress all debug info.
-        # Disable DEBUG_INFO — saves 6+ GB of .o bloat
-        # Disable UAPI_HEADER_TEST — stops 940 header .o compilations that fill disk
-        #   before the real kernel drivers even start compiling (confirmed from build log)
+        # Disable DEBUG_INFO — saves 6+ GB of .o bloat (DWARF debug symbols)
+        # Disable UAPI_HEADER_TEST — stops 940 extra header .o compilations
         # Disable HEADERS_INSTALL — no need to install kernel headers in CI
         scripts/config --file out/.config \
           --disable DEBUG_INFO \
@@ -497,7 +448,7 @@ jobs:
           --disable UAPI_HEADER_TEST \
           --disable HEADERS_INSTALL
 
-        # Re-run olddefconfig to resolve Kconfig dependencies
+        # Re-run olddefconfig to resolve Kconfig dependencies after our changes
         make O=out \
           ARCH=arm64 \
           CC=clang \
@@ -518,13 +469,9 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
     #
-    # ROOT CAUSE:
-    #   arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile line 14 uses
-    #   8-space indentation instead of a TAB character. GNU make strictly
-    #   requires TAB for recipe lines and throws "missing separator" otherwise.
-    #   This is a bug in the OnePlusOSS repo itself (spaces committed instead
-    #   of tabs). We fix it at build time by converting leading spaces→tabs
-    #   in ALL Makefiles under the vendor DTS tree before building.
+    # arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile uses 8-space
+    # indentation instead of TABs on recipe lines. GNU make requires TABs.
+    # This is a bug in the OnePlusOSS repo — fix at build time.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix vendor DTB Makefile indentation
       working-directory: ${{ github.workspace }}/kernel_source
@@ -537,41 +484,30 @@ jobs:
         fi
 
         echo "Scanning Makefiles under $DTS_VENDOR for space-indented lines..."
-        FIXED=0
 
         find "$DTS_VENDOR" -name "Makefile" -o -name "Kbuild" | while read -r mkfile; do
-          # Convert lines that start with 8 spaces (recipe lines) to TAB
-          # Only touch lines that look like make recipe lines (not variable assignments)
           if grep -Pq "^        [^\s#=]" "$mkfile" 2>/dev/null; then
-            # Use unexpand to convert leading spaces to tabs (8 spaces = 1 tab)
             unexpand --first-only -t 8 "$mkfile" > "$mkfile.fixed" \
               && mv "$mkfile.fixed" "$mkfile"
             echo "  Fixed: $mkfile"
-            FIXED=$((FIXED + 1))
           fi
         done
 
         echo "Makefile fix complete."
 
-        # Verify the known-bad file is now fixed
         BADFILE="$DTS_VENDOR/oplus/lemonadev/Makefile"
         if [ -f "$BADFILE" ]; then
-          echo "=== Line 14 of $BADFILE ==="
+          echo "=== Line 12-16 of $BADFILE ==="
           sed -n '12,16p' "$BADFILE" | cat -A
         fi
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 11 — Build kernel Image
-    # Image and dtbs are built separately so a DTB error does not fail the
-    # critical Image build. The kernel Image is what gets flashed.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build kernel Image
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        # DEBUG_INFO=n passed on command line — overrides .config and cannot be
-        # re-enabled by Kconfig dependency resolution during the build.
-        # This is the only 100% reliable way to suppress DWARF symbols.
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -582,14 +518,14 @@ jobs:
           CONFIG_DEBUG_INFO=n \
           CONFIG_DEBUG_INFO_NONE=y \
           Image > $GITHUB_WORKSPACE/build.log 2>&1
-        # Show last 20 lines in Actions UI for live feedback
         tail -20 $GITHUB_WORKSPACE/build.log || true
 
         if [ ! -f out/arch/arm64/boot/Image ]; then
           echo ""
           echo "══════════ BUILD FAILED ══════════"
-          echo "--- Compiler errors (grep fatal/error) ---"
-          grep -E "fatal error:|error:" $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -40 || true
+          echo "--- Compiler errors ---"
+          grep -E "fatal error:|error:|No such file or directory|Stop\." \
+            $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -60 || true
           echo ""
           echo "--- Last 60 lines of build.log ---"
           tail -60 $GITHUB_WORKSPACE/build.log
@@ -635,7 +571,8 @@ jobs:
         echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10 — Build out-of-tree vendor modules
+    # STEP 14 — Build out-of-tree vendor modules
+    # Walks vendor_modules/ top-level looking for Kbuild/Makefile entries.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build vendor modules
       run: |
@@ -662,7 +599,7 @@ jobs:
         echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 11 — Collect DTB blobs
+    # STEP 15 — Collect DTB blobs
     # ══════════════════════════════════════════════════════════════════════════
     - name: Collect DTB blobs
       run: |
@@ -672,7 +609,7 @@ jobs:
         echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 12 — Prepare AnyKernel3
+    # STEP 16 — Prepare AnyKernel3
     # ══════════════════════════════════════════════════════════════════════════
     - name: Prepare AnyKernel3
       run: |
@@ -712,7 +649,7 @@ jobs:
           > $GITHUB_WORKSPACE/anykernel/anykernel.sh
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 13 — Assemble flashable package
+    # STEP 17 — Assemble flashable package
     # ══════════════════════════════════════════════════════════════════════════
     - name: Assemble flashable package
       run: |
@@ -736,7 +673,7 @@ jobs:
         echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 14 — Create flashable ZIP
+    # STEP 18 — Create flashable ZIP
     # ══════════════════════════════════════════════════════════════════════════
     - name: Create flashable ZIP
       run: |
@@ -750,7 +687,7 @@ jobs:
         du -h $GITHUB_WORKSPACE/$ZIP_NAME
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 15 — Upload artifacts
+    # STEP 19 — Upload artifacts
     # ══════════════════════════════════════════════════════════════════════════
     - name: Upload flashable kernel ZIP
       uses: actions/upload-artifact@v4
