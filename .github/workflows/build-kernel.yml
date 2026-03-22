@@ -165,7 +165,65 @@ jobs:
         ls "$TECHPACK_DEST" 
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Fix CRLF line endings in Kconfig files
+    # STEP 5 — Clone techpack/camera (Qualcomm camera kernel)
+    #
+    # kernel/Makefile:1956 requires techpack/camera — same pattern as audio.
+    # OnePlusOSS publishes this as android_vendor_qcom_opensource_camera-kernel.
+    # No Android 14 branch exists — default branch covers all SM8350 versions.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone techpack/camera
+      run: |
+        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/camera
+
+        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
+          echo "techpack/camera already present — skipping"
+          exit 0
+        fi
+
+        VM_CAM=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5           \( -name "camera-kernel" -o -name "camera_kernel" \) -type d 2>/dev/null | head -1)
+        if [ -n "$VM_CAM" ] && [ -f "$VM_CAM/Makefile" ]; then
+          echo "Found camera kernel in vendor_modules: $VM_CAM"
+          ln -sfn "$VM_CAM" "$TECHPACK_DEST"
+          exit 0
+        fi
+
+        echo "Cloning techpack/camera (default branch)..."
+        git clone --depth=1           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_camera-kernel.git           "$TECHPACK_DEST"
+
+        if [ ! -f "$TECHPACK_DEST/Makefile" ]; then
+          echo "ERROR: Makefile missing after clone!"
+          ls "$TECHPACK_DEST"
+          exit 1
+        fi
+        echo "Cloned at: $(git -C $TECHPACK_DEST log --oneline -1)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 6 — Clone techpack/video (Qualcomm video kernel)
+    #
+    # Pre-emptively cloned — kernel/Makefile references techpack/video
+    # alongside audio and camera. Same pattern, same reasoning.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone techpack/video
+      run: |
+        TECHPACK_DEST=$GITHUB_WORKSPACE/kernel_source/techpack/video
+
+        if [ -d "$TECHPACK_DEST" ] && [ -f "$TECHPACK_DEST/Makefile" ]; then
+          echo "techpack/video already present — skipping"
+          exit 0
+        fi
+
+        VM_VID=$(find $GITHUB_WORKSPACE/vendor_modules -maxdepth 5           \( -name "video-driver" -o -name "video_kernel" \) -type d 2>/dev/null | head -1)
+        if [ -n "$VM_VID" ] && [ -f "$VM_VID/Makefile" ]; then
+          echo "Found video kernel in vendor_modules: $VM_VID"
+          ln -sfn "$VM_VID" "$TECHPACK_DEST"
+          exit 0
+        fi
+
+        echo "Cloning techpack/video (default branch)..."
+        git clone --depth=1           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_video-driver-sm8350.git           "$TECHPACK_DEST"           || echo "WARNING: video-driver clone failed (non-fatal if not required)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 7 — Fix CRLF line endings in Kconfig files
     #
     # 69 warnings found in build log:
     #   drivers/soc/oplus/system/cmdline_parser/Kconfig: CRLF line endings
