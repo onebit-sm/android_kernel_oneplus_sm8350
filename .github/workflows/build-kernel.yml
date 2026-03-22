@@ -117,7 +117,41 @@ jobs:
           $GITHUB_WORKSPACE/kernel_source
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Setup AOSP workspace layout + fix all symlinks
+    # STEP 4 — Clone techpack/audio (Qualcomm audio kernel)
+    #
+    # ROOT CAUSE OF PREVIOUS BUILD FAILURE (confirmed from build log):
+    #   ../techpack/audio/Makefile: No such file or directory
+    #   make[2]: *** [techpack/audio] Error 2
+    #
+    # techpack/audio is a SEPARATE Qualcomm OSS repository that must be cloned
+    # into the kernel tree at techpack/audio/ before building. It is not part
+    # of the main kernel source repo. The 286 "LLVM ERROR: Broken pipe" messages
+    # in the previous log were pure cascade noise from this single missing dir.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Clone techpack/audio
+      run: |
+        git clone           --depth=1           --branch oneplus/sm8350_u_14.0.0_oneplus9           https://github.com/OnePlusOSS/android_vendor_qcom_opensource_audio_kernel_sm8350.git           $GITHUB_WORKSPACE/kernel_source/techpack/audio
+
+        echo "techpack/audio cloned:"
+        ls $GITHUB_WORKSPACE/kernel_source/techpack/audio/
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 5 — Fix CRLF line endings in Kconfig files
+    #
+    # 69 warnings found in build log:
+    #   drivers/soc/oplus/system/cmdline_parser/Kconfig: CRLF line endings
+    # Windows-style \r\n endings in Kconfig files cause "unexpected character"
+    # warnings and can break parsing on strict Kconfig versions. Fix all of them.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Fix CRLF line endings in Kconfig files
+      run: |
+        echo "Fixing CRLF in Kconfig files..."
+        find $GITHUB_WORKSPACE/kernel_source -name "Kconfig" -exec sed -i 's/\r//' {} \;
+        find $GITHUB_WORKSPACE/vendor_modules -name "Kconfig" -exec sed -i 's/\r//' {} \;
+        echo "CRLF fix complete"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 6 — Setup AOSP workspace layout + fix all symlinks
     #
     # WHY THIS IS NEEDED:
     #   OnePlus ships the kernel source with git-tracked symlinks that assume
@@ -265,7 +299,7 @@ jobs:
         ls $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h && echo "  OK: include path target exists" || echo "  WARN: mm/internal.h not found"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 5 — Install build dependencies
+    # STEP 7 — Install build dependencies
     # ══════════════════════════════════════════════════════════════════════════
     - name: Install build dependencies
       run: |
@@ -288,7 +322,7 @@ jobs:
           binutils-aarch64-linux-gnu
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 6 — Download Clang r383902b1
+    # STEP 8 — Download Clang r383902b1
     # Confirmed URL: android11-qpr2-release branch, direct tgz from googlesource
     # ══════════════════════════════════════════════════════════════════════════
     - name: Download Clang r383902b1
@@ -332,7 +366,7 @@ jobs:
         echo "CLANG_BIN_DIR=$GITHUB_WORKSPACE/toolchain/clang/bin" >> $GITHUB_ENV
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 7 — Generate .config from defconfig
+    # STEP 9 — Generate .config from defconfig
     # ══════════════════════════════════════════════════════════════════════════
     - name: Generate .config from defconfig
       working-directory: ${{ github.workspace }}/kernel_source
@@ -395,7 +429,7 @@ jobs:
         df -h /
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 8 — Fix corrupted Makefiles in vendor DTB tree
+    # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
     #
     # ROOT CAUSE:
     #   arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile line 14 uses
@@ -440,7 +474,7 @@ jobs:
         fi
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9 — Build kernel Image
+    # STEP 11 — Build kernel Image
     # Image and dtbs are built separately so a DTB error does not fail the
     # critical Image build. The kernel Image is what gets flashed.
     # ══════════════════════════════════════════════════════════════════════════
@@ -478,7 +512,7 @@ jobs:
         du -h out/arch/arm64/boot/Image
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10 — Build DTBs (non-fatal)
+    # STEP 12 — Build DTBs (non-fatal)
     # Separated from Image so a vendor DTB Makefile bug does not block flashing.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build DTBs
@@ -497,7 +531,7 @@ jobs:
           || echo "WARNING: DTB build had errors (non-fatal — Image still usable)"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 11 — Build in-tree kernel modules
+    # STEP 13 — Build in-tree kernel modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build in-tree kernel modules
       working-directory: ${{ github.workspace }}/kernel_source
