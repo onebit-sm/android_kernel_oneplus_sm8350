@@ -363,14 +363,20 @@ jobs:
         #   DEBUG_INFO (master switch)
         #   DEBUG_INFO_NONE / DEBUG_INFO_REDUCED / DEBUG_INFO_DWARF4 (sub-choice)
         # We must disable the master switch to suppress all debug info.
+        # Disable DEBUG_INFO — saves 6+ GB of .o bloat
+        # Disable UAPI_HEADER_TEST — stops 940 header .o compilations that fill disk
+        #   before the real kernel drivers even start compiling (confirmed from build log)
+        # Disable HEADERS_INSTALL — no need to install kernel headers in CI
         scripts/config --file out/.config \
           --disable DEBUG_INFO \
           --disable DEBUG_INFO_DWARF4 \
           --disable DEBUG_INFO_REDUCED \
           --disable DEBUG_INFO_SPLIT \
-          --enable  DEBUG_INFO_NONE
+          --enable  DEBUG_INFO_NONE \
+          --disable UAPI_HEADER_TEST \
+          --disable HEADERS_INSTALL
 
-        # Re-run olddefconfig so Kconfig resolves the choice block consistently
+        # Re-run olddefconfig to resolve Kconfig dependencies
         make O=out \
           ARCH=arm64 \
           CC=clang \
@@ -380,8 +386,10 @@ jobs:
           LLVM_IAS=1 \
           olddefconfig
 
-        echo "=== DEBUG_INFO config result (should show NONE=y or not set) ==="
-        grep "CONFIG_DEBUG_INFO" out/.config || true
+        echo "=== Config verification ==="
+        echo -n "DEBUG_INFO:        "; grep "CONFIG_DEBUG_INFO_NONE\|^CONFIG_DEBUG_INFO=" out/.config | head -3 || echo "not set"
+        echo -n "UAPI_HEADER_TEST:  "; grep "UAPI_HEADER_TEST"  out/.config || echo "not set (good)"
+        echo -n "HEADERS_INSTALL:   "; grep "HEADERS_INSTALL"   out/.config || echo "not set (good)"
         echo ""
         echo "=== Disk space before build ==="
         df -h /
@@ -440,7 +448,9 @@ jobs:
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        # Write log directly to file — tee causes "Broken pipe" if disk fills
+        # DEBUG_INFO=n passed on command line — overrides .config and cannot be
+        # re-enabled by Kconfig dependency resolution during the build.
+        # This is the only 100% reliable way to suppress DWARF symbols.
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -448,8 +458,10 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          Image > $GITHUB_WORKSPACE/build.log 2>&1 || true
-        # Show last lines live so Actions log is not empty
+          CONFIG_DEBUG_INFO=n \
+          CONFIG_DEBUG_INFO_NONE=y \
+          Image > $GITHUB_WORKSPACE/build.log 2>&1
+        # Show last 20 lines in Actions UI for live feedback
         tail -20 $GITHUB_WORKSPACE/build.log || true
 
         if [ ! -f out/arch/arm64/boot/Image ]; then
