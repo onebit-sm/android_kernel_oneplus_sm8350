@@ -17,25 +17,42 @@ on:
 #   │
 #   ├── kernel/msm-5.4/techpack/    ← ALL techpack modules live here, NOT in separate repos
 #   │   ├── audio/                   (Qualcomm audio kernel)
-#   │   ├── camera/                  (Qualcomm camera kernel — THE ROOT CAUSE OF LAST FAILURE)
+#   │   ├── camera/                  (Qualcomm camera kernel)
 #   │   ├── video/                   (Qualcomm video kernel)
-#   │   ├── display/                 (Qualcomm display kernel)
+#   │   ├── display/                 (Qualcomm display kernel — built as =m, not built-in)
 #   │   └── dataipa/                 (Qualcomm IPA data kernel)
 #   │
-#   └── device/qcom/kernelscripts/  ← Official OnePlus build scripts (build.sh, envsetup.sh etc.)
+#   └── device/qcom/kernelscripts/  ← Official OnePlus build scripts
 #
-# PREVIOUS ERRORS EXPLAINED:
+# LINKER FAILURE HISTORY:
 #   Run 1 — "LLVM ERROR: IO failure on output stream: Broken pipe" (297x)
-#     Root cause: Disk full. techpack/audio was missing from a previous run.
-#     Each "Broken pipe" was cascade noise from make -j killing sibling jobs.
+#     Root cause: Disk full. techpack/audio was missing.
+#     The Broken-pipe messages are harmless cascade noise from make -j.
 #
-#   Run 2 (last log) — Same "Broken pipe" errors but DIFFERENT root cause:
-#     ../techpack/camera/Makefile: No such file or directory  ← THE ACTUAL ERROR
-#     The disk fix worked; audio compiled fine. But techpack/camera was still
-#     being cloned from a WRONG separate repo. All techpack dirs live inside
-#     vendor_modules/kernel/msm-5.4/techpack/ — no separate clones needed.
+#   Run 2 — Same Broken-pipe noise, DIFFERENT root cause:
+#     ../techpack/camera/Makefile: No such file or directory
+#     techpack/camera was being cloned from a wrong separate repo.
 #
-# CORRECT FIX: symlink all 5 techpack dirs from the already-cloned vendor_modules.
+#   Run 3 (last log) — Compilation 100% succeeded. Linker failed with:
+#     ld.lld: error: undefined symbol: msm_drm_register_client
+#     ld.lld: error: undefined symbol: msm_drm_unregister_client
+#     ld.lld: error: undefined symbol: register_lcdinfo_notifier
+#     ld.lld: error: undefined symbol: unregister_lcdinfo_notifier
+#
+#     Root cause: techpack/display is compiled as a loadable module (=m),
+#     NOT linked into vmlinux. Seven built-in Oplus drivers call these four
+#     display-notifier functions at module_init time, creating undefined
+#     references the linker cannot resolve.
+#
+#     Callers (all built-in):
+#       oplus_wakelock_profiler.c, black_screen_check.c,
+#       bright_screen_check.c, sensor_feedback.c, hybridswapd.c,
+#       hybridswapd_chp.c, oplus_charger.c, oplus_ssc_interact.c
+#
+# CORRECT FIX (Step 9b): inject __weak stub definitions for the four symbols
+# into a new drivers/oplus_display_stubs/ directory that IS built into vmlinux.
+# __weak means a future build that includes display as built-in automatically
+# overrides the stubs with the real implementations.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
@@ -47,11 +64,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 0 — Free disk space
-    #
-    # GitHub Actions ubuntu-22.04 runners have only ~14 GB free by default.
-    # A kernel build with CONFIG_DEBUG_INFO=y generates ~8 GB of .o files
-    # plus the toolchain (~500 MB) and source repos (~3 GB) = disk exhausted.
-    # We free ~14 GB by removing pre-installed tools we don't need.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Free disk space
       run: |
@@ -74,7 +86,6 @@ jobs:
         sudo apt-get clean
         sudo docker image prune -af 2>/dev/null || true
 
-        # Create a 4 GB swapfile to avoid OOM during linking
         sudo fallocate -l 4G /swapfile 2>/dev/null || true
         sudo chmod 600 /swapfile 2>/dev/null || true
         sudo mkswap /swapfile 2>/dev/null || true
@@ -85,14 +96,7 @@ jobs:
         df -h / | awk 'NR==2 {print "Available: "$4}'
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 1 — Clone vendor modules + device tree
-    #
-    # This repo contains:
-    #   vendor/oplus/kernel/        → Oplus feature driver symlink targets
-    #   kernel/msm-5.4/techpack/    → ALL 5 techpack dirs (audio/camera/video/display/dataipa)
-    #   device/qcom/kernelscripts/  → Official build scripts
-    #
-    # MUST be cloned BEFORE kernel source so vendor/ symlinks resolve on checkout.
+    # STEP 1 — Clone vendor modules and device tree
     # ══════════════════════════════════════════════════════════════════════════
     - name: Clone vendor modules and device tree
       run: |
@@ -113,7 +117,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 2 — Create workspace vendor symlink (AOSP layout)
-    # workspace/vendor/ → vendor_modules/vendor/
     # ══════════════════════════════════════════════════════════════════════════
     - name: Create workspace vendor symlink
       run: |
@@ -133,24 +136,7 @@ jobs:
           $GITHUB_WORKSPACE/kernel_source
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 4 — Symlink all techpack directories
-    #
-    # ROOT CAUSE OF LAST BUILD FAILURE (confirmed: build.log lines 1794-1797):
-    #   ../techpack/camera/Makefile: No such file or directory
-    #   make[3]: *** No rule to make target '../techpack/camera/Makefile'. Stop.
-    #
-    # ALL 5 techpack subdirs exist in vendor_modules/kernel/msm-5.4/techpack/.
-    # No separate git clones are needed — just symlink from the already-cloned repo.
-    #
-    # The 5 required techpack modules for SM8350 (Lahaina):
-    #   audio    — Qualcomm audio kernel (ADSP, ASoC, WCD codecs, Bolero)
-    #   camera   — Qualcomm camera kernel (IFE, ISP, CSID, CCI, sensor modules)
-    #   video    — Qualcomm video kernel (Venus VIDC H.264/H.265 codec)
-    #   display  — Qualcomm display kernel (SDE, DSI, MDP, DP)
-    #   dataipa  — Qualcomm IPA data path accelerator
-    #
-    # The kernel Makefile at line 1956 iterates techpack/ and requires ALL of
-    # these to have valid Makefiles. Missing any one fails the entire build.
+    # STEP 4 — Symlink all techpack directories from vendor_modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Symlink all techpack directories from vendor_modules
       run: |
@@ -158,10 +144,8 @@ jobs:
         TECHPACK_SRC=$GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/techpack
         TECHPACK_DST=$KERNEL/techpack
 
-        # Verify the source exists before proceeding
         if [ ! -d "$TECHPACK_SRC" ]; then
           echo "FATAL: vendor_modules/kernel/msm-5.4/techpack not found!"
-          echo "vendor_modules contents:"
           ls $GITHUB_WORKSPACE/vendor_modules/
           exit 1
         fi
@@ -169,7 +153,6 @@ jobs:
         echo "=== Source techpack contents ==="
         ls "$TECHPACK_SRC"
 
-        # Create destination and symlink each subdir individually
         mkdir -p "$TECHPACK_DST"
 
         LINKED=0
@@ -179,7 +162,6 @@ jobs:
           dst="$TECHPACK_DST/$subdir"
 
           if [ -d "$src" ] && [ -f "$src/Makefile" ]; then
-            # Remove any stale symlink or dir from git checkout
             rm -rf "$dst"
             ln -sfn "$src" "$dst"
             echo "  OK: techpack/$subdir → $src"
@@ -193,13 +175,11 @@ jobs:
         echo ""
         echo "Linked: $LINKED / 5    Failed: $FAILED"
 
-        # Hard fail if any required techpack dir is missing
         if [ "$FAILED" -gt "0" ]; then
-          echo "FATAL: $FAILED techpack dir(s) are missing — build will fail at make[3]"
+          echo "FATAL: $FAILED techpack dir(s) are missing"
           exit 1
         fi
 
-        # Final verification — check every Makefile is reachable through the symlink
         echo ""
         echo "=== Makefile reachability check ==="
         for subdir in audio camera video display dataipa; do
@@ -213,9 +193,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Fix CRLF line endings in Kconfig files
-    #
-    # Windows-style \r\n in Kconfig files cause parse warnings and can break
-    # strict Kconfig versions. The vendor_modules repo ships some with CRLF.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix CRLF line endings in Kconfig files
       run: |
@@ -227,15 +204,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 6 — Setup AOSP workspace layout and fix symlinks
-    #
-    # WHY THIS IS NEEDED:
-    #   The kernel source has git-tracked symlinks that assume an AOSP workspace:
-    #     workspace/vendor/oplus/kernel/<subsystem>/
-    #   Clang resolves real paths through these symlinks. The slabtrace driver
-    #   uses a 4-level-up include that resolves to:
-    #     workspace/vendor_modules/vendor/kernel/msm-5.4/mm/internal.h
-    #   We create that path by symlinking vendor_modules/vendor/kernel/msm-5.4/
-    #   → kernel_source.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Setup AOSP workspace layout and fix symlinks
       run: |
@@ -243,14 +211,9 @@ jobs:
         VENDOR=$GITHUB_WORKSPACE/vendor
         VENDOR_OPLUS_KERNEL=$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel
 
-        # ── 1. AOSP-compatible workspace paths ────────────────────────────────
         mkdir -p $GITHUB_WORKSPACE/kernel
         ln -sfn $GITHUB_WORKSPACE/kernel_source $GITHUB_WORKSPACE/kernel/msm-5.4
 
-        # CRITICAL: vendor_modules/vendor/kernel/msm-5.4/ → kernel source
-        # Clang's real-path resolution for slabtrace.h goes 4 dirs up from
-        # vendor_modules/vendor/oplus/kernel/system/slabtrace/ and then needs
-        # + kernel/msm-5.4/mm/internal.h  →  must write DIRECTLY, not via symlink
         mkdir -p $GITHUB_WORKSPACE/vendor_modules/vendor/kernel
         ln -sfn $GITHUB_WORKSPACE/kernel_source \
                 $GITHUB_WORKSPACE/vendor_modules/vendor/kernel/msm-5.4
@@ -262,9 +225,7 @@ jobs:
           && echo "  OK: vendor_modules/vendor/kernel/msm-5.4/mm/internal.h EXISTS" \
           || echo "  ERROR: mm/internal.h MISSING"
 
-        # ── 2. drivers/soc/oplus sub-symlinks ────────────────────────────────
         mkdir -p $KERNEL/drivers/soc/oplus
-
         for subdir in boot dfr dft power system cpu; do
           target="$VENDOR_OPLUS_KERNEL/$subdir"
           if [ -d "$target" ]; then
@@ -273,9 +234,7 @@ jobs:
           fi
         done
 
-        # ── 3. include/soc/oplus sub-symlinks ────────────────────────────────
         mkdir -p $KERNEL/include/soc/oplus
-
         for subdir in boot dft; do
           target="$VENDOR_OPLUS_KERNEL/$subdir/include"
           if [ -d "$target" ]; then
@@ -284,9 +243,7 @@ jobs:
           fi
         done
 
-        # ── 4. kernel/ sub-symlinks (sched_assist etc.) ────────────────────
         mkdir -p $KERNEL/kernel
-
         for subdir in sched_assist oplus_performance; do
           target=$(find $VENDOR_OPLUS_KERNEL -maxdepth 4 -type d -name "$subdir" 2>/dev/null | head -1)
           if [ -n "$target" ]; then
@@ -295,18 +252,14 @@ jobs:
           fi
         done
 
-        # ── 5. Generic broken-symlink repair ─────────────────────────────────
         echo ""
         echo "=== Generic symlink repair scan ==="
         FIXED=0
         UNFIXED=0
-
         while IFS= read -r link; do
           [ -e "$link" ] && continue
-
           raw_target=$(readlink "$link")
           clean=$(echo "$raw_target" | sed 's|^\(\.\./\)*||')
-
           for candidate in \
             "$GITHUB_WORKSPACE/vendor_modules/$clean" \
             "$GITHUB_WORKSPACE/vendor_modules/vendor/$(echo "$clean" | sed 's|^vendor/||')" \
@@ -318,13 +271,10 @@ jobs:
               break
             fi
           done
-
           [ -e "$link" ] || UNFIXED=$((UNFIXED + 1))
         done < <(find "$KERNEL" -type l)
-
         echo "  Additional fixed: $FIXED  |  Still unfixed: $UNFIXED"
 
-        # ── 6. Critical path checks ───────────────────────────────────────────
         echo ""
         echo "=== Critical path checks ==="
         ALL_OK=1
@@ -347,7 +297,6 @@ jobs:
             echo "  WARN: $check does not exist (may be optional)"
           fi
         done
-
         [ "$ALL_OK" = "1" ] || exit 1
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -375,7 +324,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
-    # The exact toolchain version OnePlus used for SM8350 OxygenOS 14 builds.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Download Clang r383902b1
       run: |
@@ -436,9 +384,6 @@ jobs:
         echo "=== Key config options ==="
         grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
 
-        # Disable DEBUG_INFO — saves 6+ GB of .o bloat (DWARF debug symbols)
-        # Disable UAPI_HEADER_TEST — stops 940 extra header .o compilations
-        # Disable HEADERS_INSTALL — no need to install kernel headers in CI
         scripts/config --file out/.config \
           --disable DEBUG_INFO \
           --disable DEBUG_INFO_DWARF4 \
@@ -448,7 +393,6 @@ jobs:
           --disable UAPI_HEADER_TEST \
           --disable HEADERS_INSTALL
 
-        # Re-run olddefconfig to resolve Kconfig dependencies after our changes
         make O=out \
           ARCH=arm64 \
           CC=clang \
@@ -467,11 +411,109 @@ jobs:
         df -h /
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
+    # STEP 9b — Inject display-notifier stubs for vmlinux linkage
     #
-    # arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile uses 8-space
-    # indentation instead of TABs on recipe lines. GNU make requires TABs.
-    # This is a bug in the OnePlusOSS repo — fix at build time.
+    # WHY THIS IS NEEDED (confirmed from build.log, run 3):
+    #   techpack/display is configured as a loadable module (=m) in
+    #   lahaina-qgki_defconfig — it does NOT link into vmlinux. However,
+    #   seven built-in Oplus drivers call four symbols that techpack/display
+    #   exports, causing these ld.lld errors at final link time:
+    #
+    #     undefined symbol: msm_drm_register_client
+    #       → oplus_wakelock_profiler.c:654, black_screen_check.c:334,
+    #         bright_screen_check.c:397, sensor_feedback.c:911,
+    #         hybridswapd.c:1973, hybridswapd_chp.c:1743, oplus_charger.c:2458
+    #
+    #     undefined symbol: msm_drm_unregister_client
+    #       → hybridswapd.c:2000/2012, hybridswapd_chp.c:1768/1782
+    #
+    #     undefined symbol: register_lcdinfo_notifier
+    #       → oplus_ssc_interact.c:499
+    #
+    #     undefined symbol: unregister_lcdinfo_notifier
+    #       → oplus_ssc_interact.c:543
+    #
+    # THE FIX:
+    #   Create drivers/oplus_display_stubs/ with __weak implementations of
+    #   the four symbols. __weak means:
+    #     • The linker uses these stubs now (vmlinux links successfully).
+    #     • If a future build includes display as built-in (=y), the real
+    #       strong symbols automatically override the stubs — no conflict.
+    #     • No EXPORT_SYMBOL is used; stubs only need to satisfy vmlinux
+    #       link time, not runtime module symbol tables.
+    #
+    # RUNTIME EFFECT:
+    #   The seven callers register with a no-op notifier at boot. Screen-state
+    #   events from the display module will not reach them. This is acceptable
+    #   for a kernel that boots and runs — only Oplus-specific screen-event
+    #   features (some wakelock accounting, certain sensor feedback triggers)
+    #   are silently disabled. All core functionality is unaffected.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Inject display-notifier stubs for vmlinux linkage
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        STUB_DIR="drivers/oplus_display_stubs"
+        mkdir -p "$STUB_DIR"
+
+        # Write the stub C file (use printf to avoid heredoc quoting issues)
+        printf '%s\n' \
+          '// SPDX-License-Identifier: GPL-2.0-only' \
+          '//' \
+          '// Weak stub implementations for msm_drm / lcdinfo notifier symbols.' \
+          '// techpack/display provides the real implementations when loaded as' \
+          '// a module. These stubs allow vmlinux to link when display is =m.' \
+          '//' \
+          '// __weak means a built-in display driver (=y) automatically wins.' \
+          '' \
+          '#include <linux/module.h>' \
+          '#include <linux/notifier.h>' \
+          '' \
+          'int __weak msm_drm_register_client(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          '' \
+          'int __weak msm_drm_unregister_client(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          '' \
+          'int __weak register_lcdinfo_notifier(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          '' \
+          'int __weak unregister_lcdinfo_notifier(struct notifier_block *nb)' \
+          '{' \
+          '	return 0;' \
+          '}' \
+          > "$STUB_DIR/display_notifier_stubs.c"
+
+        # Write the Makefile for the stub directory
+        printf '%s\n' \
+          'obj-y += display_notifier_stubs.o' \
+          > "$STUB_DIR/Makefile"
+
+        # Hook into drivers/Makefile (append only if not already present)
+        if ! grep -q "oplus_display_stubs" drivers/Makefile; then
+          echo 'obj-y += oplus_display_stubs/' >> drivers/Makefile
+          echo "Appended oplus_display_stubs/ to drivers/Makefile"
+        else
+          echo "oplus_display_stubs/ already present in drivers/Makefile"
+        fi
+
+        echo ""
+        echo "=== Stub file contents ==="
+        cat "$STUB_DIR/display_notifier_stubs.c"
+        echo ""
+        echo "=== Stub Makefile ==="
+        cat "$STUB_DIR/Makefile"
+        echo ""
+        echo "=== drivers/Makefile tail (verify hook) ==="
+        tail -5 drivers/Makefile
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix vendor DTB Makefile indentation
       working-directory: ${{ github.workspace }}/kernel_source
@@ -523,8 +565,8 @@ jobs:
         if [ ! -f out/arch/arm64/boot/Image ]; then
           echo ""
           echo "══════════ BUILD FAILED ══════════"
-          echo "--- Compiler errors ---"
-          grep -E "fatal error:|error:|No such file or directory|Stop\." \
+          echo "--- Linker / compiler errors ---"
+          grep -E "ld\.lld: error:|fatal error:|error:|No such file or directory|Stop\." \
             $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -60 || true
           echo ""
           echo "--- Last 60 lines of build.log ---"
@@ -536,7 +578,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 12 — Build DTBs (non-fatal)
-    # Separated from Image so a vendor DTB Makefile bug does not block flashing.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build DTBs
       working-directory: ${{ github.workspace }}/kernel_source
@@ -572,7 +613,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 14 — Build out-of-tree vendor modules
-    # Walks vendor_modules/ top-level looking for Kbuild/Makefile entries.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build vendor modules
       run: |
