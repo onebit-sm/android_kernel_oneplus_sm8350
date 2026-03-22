@@ -556,6 +556,44 @@ jobs:
         tail -5 drivers/Makefile
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9c — Fix fingerprint driver include path
+    #
+    # drivers/input/uff_fp_drivers is a symlink → vendor_modules/vendor/oplus/
+    #   secure/biometrics/fingerprints/bsp/uff/driver/
+    # fp_driver.c line 90 uses:
+    #   #include "touchpanel_event_notify.h"   ← WRONG: relative/local search only
+    # The header exists at include/soc/oplus/touchpanel_event_notify.h but
+    # the double-quote form doesn't find it there. Fix: change to angle-bracket
+    # form which searches the kernel's global include tree.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Fix fingerprint driver include path
+      run: |
+        # Search both the kernel symlink path AND the real vendor_modules path
+        # because the symlink may or may not be resolved depending on the shell
+        for search_root in \
+          "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
+          "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
+        do
+          FP_FILE=$(find "$search_root" -name "fp_driver.c" 2>/dev/null | head -1)
+          if [ -n "$FP_FILE" ]; then
+            echo "Found fp_driver.c at: $FP_FILE"
+            # Fix the include — change double-quote to angle-bracket form
+            sed -i \
+              's|#include "touchpanel_event_notify\.h"|#include <soc/oplus/touchpanel_event_notify.h>|g' \
+              "$FP_FILE"
+            echo "Fixed include in: $FP_FILE"
+            echo "=== Verify fix (line 88-92) ==="
+            sed -n '88,92p' "$FP_FILE"
+            break
+          fi
+        done
+
+        if [ -z "$FP_FILE" ]; then
+          echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
+        fi
+
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
     #
     # NOTE: After the Step 5 CRLF fix, the primary cause of the lemonadev
