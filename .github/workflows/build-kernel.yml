@@ -30,6 +30,40 @@ jobs:
     steps:
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 0 — Free disk space
+    #
+    # ROOT CAUSE OF PREVIOUS FAILURE:
+    #   "LLVM ERROR: IO failure on output stream: Broken pipe" = disk full.
+    #   GitHub Actions ubuntu-22.04 runners have only ~14 GB free by default.
+    #   A kernel build with CONFIG_DEBUG_INFO=y generates ~8 GB of .o files
+    #   plus the toolchain (~500 MB) and source repos (~3 GB) = disk exhausted.
+    #
+    # We free ~14 GB by removing pre-installed tools we don't need:
+    #   - Android SDK/NDK     (~8 GB)
+    #   - .NET runtime        (~2 GB)
+    #   - Haskell/GHC         (~2 GB)
+    #   - CodeQL              (~1 GB)
+    #   - Swap is also added to handle peak memory during linking
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Free disk space
+      run: |
+        echo "=== Disk before cleanup ==="
+        df -h /
+
+        # Remove large pre-installed components not needed for kernel builds
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/share/boost
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/share/swift
+        sudo apt-get clean
+        sudo docker image prune -af 2>/dev/null || true
+
+        echo "=== Disk after cleanup ==="
+        df -h /
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 1 — Clone vendor modules + device tree FIRST
     # Must be cloned before kernel source so the vendor/ symlink is in place
     # before git restores the kernel source symlinks.
@@ -300,6 +334,17 @@ jobs:
         echo "=== Key config options ==="
         grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
 
+        # ── Disable debug info to save ~6 GB of disk space ───────────────────
+        # CONFIG_DEBUG_INFO=y is set in your device config and causes every .o
+        # file to contain DWARF debug symbols, ballooning build size to 20+ GB.
+        # For a flashable kernel we only need the Image binary — debug info is
+        # not included in the final boot.img. Disabling it is safe.
+        scripts/config --file out/.config --disable DEBUG_INFO
+        scripts/config --file out/.config --disable DEBUG_INFO_DWARF4
+        scripts/config --file out/.config --set-val  DEBUG_INFO_NONE y
+        echo "DEBUG_INFO disabled to save disk space"
+        grep "CONFIG_DEBUG_INFO" out/.config | head -5 || true
+
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Fix corrupted Makefiles in vendor DTB tree
     #
@@ -354,6 +399,7 @@ jobs:
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
+        # Write log directly to file — tee causes "Broken pipe" if disk fills
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -361,7 +407,9 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          Image 2>&1 | tee $GITHUB_WORKSPACE/build.log
+          Image > $GITHUB_WORKSPACE/build.log 2>&1 || true
+        # Show last lines live so Actions log is not empty
+        tail -20 $GITHUB_WORKSPACE/build.log || true
 
         if [ ! -f out/arch/arm64/boot/Image ]; then
           echo ""
