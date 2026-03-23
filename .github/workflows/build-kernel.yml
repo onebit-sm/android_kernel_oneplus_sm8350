@@ -663,7 +663,7 @@ jobs:
               $GITHUB_WORKSPACE/anykernel/dtb \
               $GITHUB_WORKSPACE/anykernel/dtbo.img
 
-        printf '%s\n' \
+                printf '%s\n' \
           '#!/bin/sh'  \
           '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14' \
           '' \
@@ -680,6 +680,11 @@ jobs:
           'device.name4=' \
           'device.name5=' \
           '' \
+          'block=boot' \
+          'is_slot_device=1' \
+          'ramdisk_compression=auto' \
+          'patch_vbmeta_flag=auto' \
+          '' \
           'supported.versions=14' \
           '' \
           '. tools/ak3-core.sh' \
@@ -687,6 +692,7 @@ jobs:
           'split_boot' \
           'flash_boot' \
           > $GITHUB_WORKSPACE/anykernel/anykernel.sh
+
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 17 — Assemble flashable package
