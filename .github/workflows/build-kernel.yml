@@ -584,7 +584,7 @@ jobs:
           "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
           "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
         do
-          FP_FILE=$(find "$search_root" -name "fp_driver.c" 2>/dev/null | head -1)
+          FP_FILE=$(find -L "$search_root" -name "fp_driver.c" 2>/dev/null | head -1)
           if [ -n "$FP_FILE" ]; then
             echo "Found fp_driver.c at: $FP_FILE"
             # Fix the include — change double-quote to angle-bracket form
@@ -601,6 +601,9 @@ jobs:
         if [ -z "$FP_FILE" ]; then
           echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
         fi
+
+        echo "=== Verify fix ==="
+        grep -n "touchpanel_event_notify" "$FP_FILE"
 
 
     # ══════════════════════════════════════════════════════════════════════════
