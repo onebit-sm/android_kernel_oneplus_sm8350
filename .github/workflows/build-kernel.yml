@@ -638,7 +638,7 @@ jobs:
         # Also scan the rest of vendor DTS tree
         DTS_VENDOR="arch/arm64/boot/dts/vendor"
         [ -d "$DTS_VENDOR" ] || exit 0
-        find "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) | while read -r mkfile; do
+        find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) | while read -r mkfile; do
          sed -i 's/\r//' "$mkfile" 2>/dev/null || true
          grep -Pq "^        [^\s#]" "$mkfile" 2>/dev/null && \
          sed -i 's/^        /\t/' "$mkfile" && \
@@ -804,7 +804,7 @@ jobs:
         printf '%s\n' \
           '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14' \
           '' \
-          'kernel.string=Stock Base Kernel - OnePlus 9 Pro (Android 14)' \
+          'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"' \
           'do.devicecheck=1' \
           'do.modules=1' \
           'do.systemless=1' \
