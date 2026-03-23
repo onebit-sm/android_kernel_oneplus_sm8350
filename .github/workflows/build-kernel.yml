@@ -490,9 +490,6 @@ jobs:
           echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
         fi
 
-        echo "=== Verify fix ==="
-        grep -n "touchpanel_event_notify" "$FP_FILE"
-
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
