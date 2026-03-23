@@ -497,25 +497,37 @@ jobs:
     - name: Fix vendor DTB Makefile indentation
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
-       LEMON_REAL=$(find -L $GITHUB_WORKSPACE/vendor_modules $GITHUB_WORKSPACE/kernel_source \
-         -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
-       if [ -n "$LEMON_REAL" ]; then
-        sed -i 's/\r//' "$LEMON_REAL"
-        sed -i 's/^        /\t/' "$LEMON_REAL"
-        echo "Fixed lemonadev/Makefile at real path: $LEMON_REAL"
-        echo "=== Lines 12-18 ==="
-        sed -n '12,18p' "$LEMON_REAL" | cat -A
+        # Find lemonadev/Makefile through BOTH real and symlink paths
+        LEMON_REAL=$(find -L \
+          "$GITHUB_WORKSPACE/vendor_modules" \
+          "$GITHUB_WORKSPACE/kernel_source" \
+          -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
+
+        if [ -n "$LEMON_REAL" ]; then
+          echo "Found: $LEMON_REAL"
+          # Strip \r AND fix space indentation
+          sed -i 's/\r//' "$LEMON_REAL"
+          sed -i 's/^        /\t/' "$LEMON_REAL"
+          echo "=== Lines 12-18 after fix ==="
+          sed -n '12,18p' "$LEMON_REAL" | cat -A
+          CR_LEFT=$(grep -cP '\r' "$LEMON_REAL" || echo 0)
+          echo "Carriage returns remaining: $CR_LEFT (must be 0)"
+        else
+          echo "FATAL: lemonadev/Makefile not found anywhere!"
+          exit 1
         fi
 
+        # Scan all vendor DTS Makefiles through symlinks
         DTS_VENDOR="arch/arm64/boot/dts/vendor"
         [ -d "$DTS_VENDOR" ] || exit 0
-        find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) | while read -r mkfile; do
-         sed -i 's/\r//' "$mkfile" 2>/dev/null || true
-         grep -Pq "^        [^\s#]" "$mkfile" 2>/dev/null && \
-         sed -i 's/^        /\t/' "$mkfile" && \
-        echo "  Fixed: $mkfile"
-       done
-       echo "Makefile indentation fix complete"
+        find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) \
+          | while read -r mkfile; do
+          sed -i 's/\r//' "$mkfile" 2>/dev/null || true
+          grep -Pq "^        [^\s#]" "$mkfile" 2>/dev/null && \
+            sed -i 's/^        /\t/' "$mkfile" && \
+            echo "  Fixed: $mkfile"
+        done
+        echo "Makefile indentation fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 11 — Build kernel Image
@@ -652,6 +664,7 @@ jobs:
               $GITHUB_WORKSPACE/anykernel/dtbo.img
 
         printf '%s\n' \
+          '#!/bin/sh'  \
           '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14' \
           '' \
           'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"' \
