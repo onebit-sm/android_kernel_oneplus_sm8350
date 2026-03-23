@@ -238,7 +238,7 @@ jobs:
           while IFS= read -r -d '' f; do
             sed -i 's/\r//' "$f"
             count=$((count + 1))
-          done < <(find "$tree" -name "Kconfig" -print0 2>/dev/null)
+          done < <(find -L "$tree" -name "Kconfig" -print0 2>/dev/null)
 
           # ── NEW: Makefile / Kbuild / *.mk ─────────────────────────────────
           # These also come from Windows editors in the OEM tree and can carry
@@ -246,7 +246,7 @@ jobs:
           while IFS= read -r -d '' f; do
             sed -i 's/\r//' "$f"
             count=$((count + 1))
-          done < <(find "$tree" \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" \) -print0 2>/dev/null)
+          done < <(find -L "$tree" \( -name "Makefile" -o -name "Kbuild" -o -name "*.mk" \) -print0 2>/dev/null)
 
           echo "  $label: $count files fixed"
         }
@@ -625,7 +625,8 @@ jobs:
       run: |
        # Fix lemonadev/Makefile through its REAL path in vendor_modules
        # (not via the arch/arm64/boot/dts/vendor symlink which may be read-only)
-       LEMON_REAL=$(find $GITHUB_WORKSPACE/vendor_modules -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
+       LEMON_REAL=$(find -L $GITHUB_WORKSPACE/vendor_modules $GITHUB_WORKSPACE/kernel_source \
+         -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
        if [ -n "$LEMON_REAL" ]; then
         sed -i 's/\r//' "$LEMON_REAL"
         sed -i 's/^        /\t/' "$LEMON_REAL"
