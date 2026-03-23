@@ -3,78 +3,6 @@ name: Build Stock Kernel & Modules (OnePlus 9 Pro - Android 14)
 on:
   workflow_dispatch:
 
-# ─────────────────────────────────────────────────────────────────────────────
-# REPOSITORY LAYOUT (android_kernel_modules_and_devicetree_oneplus_sm8350)
-#
-# The vendor_modules repo contains THREE distinct trees, all in one repo:
-#
-#   vendor_modules/
-#   ├── vendor/oplus/kernel/         ← Oplus kernel feature modules
-#   │   ├── charger/                 (symlinked into kernel_source/drivers/power/oplus_chg)
-#   │   ├── system/                  (symlinked into kernel_source/drivers/soc/oplus/system)
-#   │   ├── touchpanel/              etc.
-#   │   └── ... (15 subdirs total)
-#   │
-#   ├── kernel/msm-5.4/techpack/    ← ALL techpack modules live here, NOT in separate repos
-#   │   ├── audio/                   (Qualcomm audio kernel)
-#   │   ├── camera/                  (Qualcomm camera kernel)
-#   │   ├── video/                   (Qualcomm video kernel)
-#   │   ├── display/                 (Qualcomm display kernel — built as =m, not built-in)
-#   │   └── dataipa/                 (Qualcomm IPA data kernel)
-#   │
-#   └── device/qcom/kernelscripts/  ← Official OnePlus build scripts
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# BUG HISTORY:
-#
-#   Run 1 — "LLVM ERROR: IO failure on output stream: Broken pipe" (297x)
-#     Root cause: Disk full. techpack/audio was missing.
-#
-#   Run 2 — "../techpack/camera/Makefile: No such file or directory"
-#     Root cause: techpack/camera was being cloned from a wrong separate repo.
-#
-#   Run 3 — vmlinux link failed:
-#     ld.lld: error: undefined symbol: msm_drm_register_client (and 3 others)
-#     Root cause: techpack/display is =m, seven built-in Oplus drivers call its
-#     exported symbols. Fixed in Step 9b with __weak stub implementations.
-#
-#   Run 4 (last log) — Image built successfully! DTBs failed:
-#     ../arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile:14:
-#       *** missing separator (did you mean TAB instead of 8 spaces?). Stop.
-#
-#     ROOT CAUSE: The lemonadev/Makefile uses CRLF (\r\n) line endings AND
-#     multi-line variable assignments with \ continuation. GNU make requires
-#     the backslash to be IMMEDIATELY before \n for continuation to work.
-#     With CRLF the sequence is: "dtb-y += foo.dtb \<CR><LF>"
-#     The \ precedes \r, not \n, so GNU make does NOT treat it as a continuation.
-#     Line 14 becomes a standalone bare token like "        lahaina-lemonadev-v5.dtb"
-#     which GNU make cannot parse → "missing separator" error.
-#
-#     WHY STEP 5 DIDN'T PREVENT IT:
-#       Step 5 stripped CRLF from -name "Kconfig" files only.
-#       Makefile / Kbuild / *.mk files were NOT processed.
-#
-#     WHY STEP 10 DIDN'T FIX IT:
-#       Step 10 tried to convert leading spaces to tabs. That addresses recipe
-#       indentation, not CRLF-broken line continuations. Even if unexpand ran
-#       on this file, \r characters would remain and break make parsing.
-#
-#     FIX (Step 5 — extended):
-#       Also strip \r from ALL Makefile, Kbuild, and *.mk files in both trees.
-#       Once CRLF is gone, the backslash-continuation lines work correctly and
-#       there are no bare "        lahaina-lemonadev.dtb" tokens for make to trip on.
-#
-#     ADDITIONAL FIX (Step 12):
-#       Add -k (keep-going) flag to make dtbs so that if any single DTB
-#       directory fails, all other DTBs are still compiled.
-#       The lemonade-specific DTBs are critical for the OP9 Pro flashable zip.
-#
-#     ADDITIONAL FIX (Step 13):
-#       Redirect make modules output to build.log so failures are visible
-#       in the uploaded artifact (previously they were invisible).
-#       Add proper non-fatal handling consistent with Step 12.
-# ─────────────────────────────────────────────────────────────────────────────
-
 jobs:
   build-kernel:
     runs-on: ubuntu-22.04
@@ -213,19 +141,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 5 — Fix CRLF line endings
-    #
-    # FIX vs. previous version:
-    #   Old: only processed files named "Kconfig"
-    #   New: also processes Makefile, Kbuild, and *.mk files in BOTH trees.
-    #
-    #   WHY THIS MATTERS:
-    #     arch/arm64/boot/dts/vendor/oplus/lemonadev/Makefile uses CRLF AND
-    #     multi-line \ continuations. GNU make requires \ to be immediately
-    #     before \n for continuation — with CRLF (\r\n) the \ precedes \r,
-    #     not \n, so make treats each continuation line as a new standalone
-    #     token. Those tokens start with 8 spaces and have no valid make
-    #     syntax → "missing separator (did you mean TAB instead of 8 spaces?)"
-    #     Stripping \r fixes the continuations and silences the error entirely.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix CRLF line endings in build files
       run: |
@@ -234,15 +149,11 @@ jobs:
           local label="$2"
           local count=0
 
-          # Kconfig files (same as before — needed for menuconfig parsing)
           while IFS= read -r -d '' f; do
             sed -i 's/\r//' "$f"
             count=$((count + 1))
           done < <(find -L "$tree" -name "Kconfig" -print0 2>/dev/null)
 
-          # ── NEW: Makefile / Kbuild / *.mk ─────────────────────────────────
-          # These also come from Windows editors in the OEM tree and can carry
-          # \r characters that break GNU make's line-continuation detection.
           while IFS= read -r -d '' f; do
             sed -i 's/\r//' "$f"
             count=$((count + 1))
@@ -482,19 +393,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9b — Inject display-notifier stubs for vmlinux linkage
-    #
-    # WHY THIS IS NEEDED (confirmed from build.log, run 3):
-    #   techpack/display is configured as a loadable module (=m) in
-    #   lahaina-qgki_defconfig — it does NOT link into vmlinux. However,
-    #   seven built-in Oplus drivers call four symbols that techpack/display
-    #   exports, causing ld.lld "undefined symbol" errors at final link time.
-    #
-    # STATUS: CONFIRMED WORKING in run 4 — vmlinux and Image both linked
-    #   successfully with zero undefined-symbol errors.
-    #
-    # The __weak stubs in drivers/oplus_display_stubs/ satisfy the linker.
-    # When techpack/display is loaded as a module at runtime, its strong-symbol
-    # definitions override these stubs automatically (standard __weak semantics).
     # ══════════════════════════════════════════════════════════════════════════
     - name: Inject display-notifier stubs for vmlinux linkage
       working-directory: ${{ github.workspace }}/kernel_source
@@ -567,19 +465,9 @@ jobs:
     
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9c — Fix fingerprint driver include path
-    #
-    # drivers/input/uff_fp_drivers is a symlink → vendor_modules/vendor/oplus/
-    #   secure/biometrics/fingerprints/bsp/uff/driver/
-    # fp_driver.c line 90 uses:
-    #   #include "touchpanel_event_notify.h"   ← WRONG: relative/local search only
-    # The header exists at include/soc/oplus/touchpanel_event_notify.h but
-    # the double-quote form doesn't find it there. Fix: change to angle-bracket
-    # form which searches the kernel's global include tree.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix fingerprint driver include path
       run: |
-        # Search both the kernel symlink path AND the real vendor_modules path
-        # because the symlink may or may not be resolved depending on the shell
         for search_root in \
           "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
           "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
@@ -608,23 +496,10 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix corrupted Makefiles in vendor DTB tree
-    #
-    # NOTE: After the Step 5 CRLF fix, the primary cause of the lemonadev
-    # "missing separator" error is already resolved (the \r was breaking
-    # backslash-continuation lines).  This step is kept as a safety net for
-    # any DTS Makefiles that additionally use spaces instead of tabs for
-    # actual recipe lines (a separate, rarer issue).
-    #
-    # The logic is:
-    #   1. Strip any residual \r (belt-and-suspenders after Step 5)
-    #   2. Convert leading 8-space sequences to TAB on lines that grep
-    #      identifies as space-indented recipe candidates
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix vendor DTB Makefile indentation
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
-       # Fix lemonadev/Makefile through its REAL path in vendor_modules
-       # (not via the arch/arm64/boot/dts/vendor symlink which may be read-only)
        LEMON_REAL=$(find -L $GITHUB_WORKSPACE/vendor_modules $GITHUB_WORKSPACE/kernel_source \
          -path "*/lemonadev/Makefile" 2>/dev/null | head -1)
        if [ -n "$LEMON_REAL" ]; then
@@ -635,7 +510,6 @@ jobs:
         sed -n '12,18p' "$LEMON_REAL" | cat -A
         fi
 
-        # Also scan the rest of vendor DTS tree
         DTS_VENDOR="arch/arm64/boot/dts/vendor"
         [ -d "$DTS_VENDOR" ] || exit 0
         find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) | while read -r mkfile; do
@@ -681,15 +555,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 12 — Build DTBs
-    #
-    # FIX vs. previous version:
-    #   Added -k (keep-going) flag to make. Without it, the first DTB directory
-    #   that fails (e.g. lemonadev before the CRLF fix) stops ALL subsequent
-    #   DTB compilation. With -k, make continues building all other DTBs even
-    #   if one subtree fails, maximising the set of DTBs available for the zip.
-    #
-    #   After the Step 5 CRLF fix the lemonadev error should not recur, but -k
-    #   is kept as a defensive measure against other potential DTB failures.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build DTBs
       working-directory: ${{ github.workspace }}/kernel_source
@@ -706,7 +571,6 @@ jobs:
           && echo "DTBs built successfully" \
           || echo "WARNING: DTB build had errors (non-fatal — Image still usable)"
 
-        # Count and list lemonade-specific DTBs to confirm they were built
         echo ""
         echo "=== Lemonade DTB check ==="
         find out/arch/arm64/boot/dts -name "*lemonad*" 2>/dev/null \
@@ -715,16 +579,6 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 13 — Build in-tree kernel modules
-    #
-    # FIX vs. previous version:
-    #   Output is now appended to build.log (2>&1 | tee -a) so that any
-    #   compilation errors are visible in the uploaded build-log artifact.
-    #   Previously, module build failures were completely invisible and could
-    #   silently terminate the workflow with a non-zero exit code.
-    #
-    #   Non-fatal handling is added consistent with the DTBs step: a modules
-    #   build failure is reported but does not stop the zip from being assembled
-    #   (the Image is the critical deliverable; modules enhance it).
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build in-tree kernel modules
       working-directory: ${{ github.workspace }}/kernel_source
@@ -780,7 +634,6 @@ jobs:
           -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
         echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
 
-        # Verify lemonade DTBs are present (critical for OP9 Pro)
         LEMON_COUNT=$(ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null | wc -l)
         echo "Lemonade-specific DTBs: $LEMON_COUNT"
         ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null || true
