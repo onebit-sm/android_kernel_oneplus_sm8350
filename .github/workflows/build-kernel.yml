@@ -233,19 +233,22 @@ jobs:
           fi
         done
 
-        # 1. Force symlink the lemonadev directory into the kernel source tree
-        mkdir -p $GITHUB_WORKSPACE/kernel_source/arch/arm64/boot/dts/vendor/oplus
-        ln -sfn $GITHUB_WORKSPACE/vendor_modules/vendor/qcom/proprietary/devicetree/oplus/lemonadev $GITHUB_WORKSPACE/kernel_source/arch/arm64/boot/dts/vendor/oplus/lemonadev
+        echo "=== Fixing lemonadev DTB inclusion ==="
+        OPLUS_REAL_DIR="$GITHUB_WORKSPACE/vendor_modules/vendor/qcom/proprietary/devicetree/oplus"
+        OPLUS_MK="$OPLUS_REAL_DIR/Makefile"
 
-        # 2. Ensure the parent Makefile instructs the compiler to build it
-        OPLUS_MK="$GITHUB_WORKSPACE/kernel_source/arch/arm64/boot/dts/vendor/oplus/Makefile"
-        if [ -f "$OPLUS_MK" ] && ! grep -q "lemonadev" "$OPLUS_MK"; then
-          echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
-          echo "Injected lemonadev into vendor/oplus/Makefile"
-        elif [ ! -f "$OPLUS_MK" ]; then
-          echo 'subdir-y += lemonadev' > "$OPLUS_MK"
-          echo "Created vendor/oplus/Makefile with lemonadev"
+        if [ -d "$OPLUS_REAL_DIR" ]; then
+          if [ -f "$OPLUS_MK" ] && ! grep -q "lemonadev" "$OPLUS_MK"; then
+            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
+            echo "  Injected lemonadev into real oplus/Makefile"
+          elif [ ! -f "$OPLUS_MK" ]; then
+            echo 'subdir-y += lemonadev' > "$OPLUS_MK"
+            echo "  Created real oplus/Makefile with lemonadev"
+          fi
+        else
+          echo "  WARNING: Real oplus directory not found at $OPLUS_REAL_DIR"
         fi
+        echo
 
         echo ""
         echo "=== Generic symlink repair scan ==="
