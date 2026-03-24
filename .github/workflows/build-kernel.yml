@@ -522,9 +522,8 @@ jobs:
 
         if [ -n "$LEMON_REAL" ]; then
           echo "Found: $LEMON_REAL"
-          # Strip \r AND fix space indentation
+          # Strip \r
           sed -i 's/\r//' "$LEMON_REAL"
-          sed -i 's/^        /\t/' "$LEMON_REAL"
           echo "=== Lines 12-18 after fix ==="
           sed -n '12,18p' "$LEMON_REAL" | cat -A
           CR_LEFT=$(grep -cP '\r' "$LEMON_REAL" || echo 0)
@@ -540,11 +539,8 @@ jobs:
         find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) \
           | while read -r mkfile; do
           sed -i 's/\r//' "$mkfile" 2>/dev/null || true
-          grep -Pq "^        [^\s#]" "$mkfile" 2>/dev/null && \
-            sed -i 's/^        /\t/' "$mkfile" && \
-            echo "  Fixed: $mkfile"
         done
-        echo "Makefile indentation fix complete"
+        echo "Makefile CRLF fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 11 — Build kernel Image
@@ -599,9 +595,12 @@ jobs:
 
         echo ""
         echo "=== Lemonade DTB check ==="
-        find out/arch/arm64/boot/dts -name "*lemonad*" 2>/dev/null \
-          | while read f; do echo "  FOUND: $f"; done \
-          || echo "  No lemonade DTBs found (check CRLF fix in Step 5)"
+        LEMON_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | wc -l)
+        if [ "$LEMON_COUNT" -eq "0" ]; then
+          echo "FATAL: No lemonade DTBs were built!"
+          exit 1
+        fi
+        find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | while read f; do echo "  FOUND: $f"; done
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 13 — Build in-tree kernel modules
@@ -725,11 +724,14 @@ jobs:
         cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
         echo "Kernel Image: OK"
 
-        DTB_COUNT=$(find $GITHUB_WORKSPACE/dtbs -name "*.dtb" 2>/dev/null | wc -l)
+        # Only copy lemonade DTBs to avoid booting the wrong reference board
+        DTB_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | wc -l)
         if [ "$DTB_COUNT" -gt "0" ]; then
           mkdir -p $AK/dtbs
-          cp $GITHUB_WORKSPACE/dtbs/*.dtb $AK/dtbs/
-          echo "DTBs copied: $DTB_COUNT"
+          find out/arch/arm64/boot/dts -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
+        else
+          echo "FATAL: No lemonade DTBs found during packaging. Aborting to prevent brick."
+          exit 1
         fi
 
         mkdir -p $AK/modules/vendor/lib/modules
