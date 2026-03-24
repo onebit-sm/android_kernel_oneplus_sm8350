@@ -233,40 +233,70 @@ jobs:
           fi
         done
 
+        # ── FIX: inject lemonadev into the correct oplus DTS Makefile ──
+        # arch/arm64/boot/dts/vendor is a symlink resolved at build time.
+        # We must find the REAL oplus/ devicetree directory inside vendor_modules
+        # and inject there — that is what the symlink ultimately resolves to.
         echo "=== Fixing lemonadev DTB inclusion ==="
-        KERNEL=$GITHUB_WORKSPACE/kernel_source
 
-        # The path that matters is inside the kernel's own DTS vendor tree
-        OPLUS_DTS_DIR="$KERNEL/arch/arm64/boot/dts/vendor/oplus"
+        # Search all likely locations for the real oplus DTS directory
+        OPLUS_DTS_DIR=""
+        for candidate in \
+          "$GITHUB_WORKSPACE/vendor_modules/kernel/msm-5.4/arch/arm64/boot/dts/vendor/oplus" \
+          "$GITHUB_WORKSPACE/vendor_modules/vendor/qcom/proprietary/devicetree/oplus" \
+          "$KERNEL/arch/arm64/boot/dts/vendor/oplus"
+        do
+          if [ -d "$candidate" ]; then
+            OPLUS_DTS_DIR="$candidate"
+            echo "  Found oplus DTS dir at: $OPLUS_DTS_DIR"
+            break
+          fi
+        done
+
+        # If none found via known paths, do a broad search
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "  Known paths not found — running broad search for lemonadev/..."
+          LEMON_DIR=$(find -L $GITHUB_WORKSPACE/vendor_modules -type d -name "lemonadev" 2>/dev/null | head -1)
+          if [ -n "$LEMON_DIR" ]; then
+            OPLUS_DTS_DIR=$(dirname "$LEMON_DIR")
+            echo "  Found via broad search — oplus DTS dir: $OPLUS_DTS_DIR"
+          fi
+        fi
+
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "FATAL: Cannot locate the oplus DTS directory containing lemonadev/"
+          echo "Searched inside vendor_modules:"
+          find $GITHUB_WORKSPACE/vendor_modules -maxdepth 8 -type d -name "oplus" 2>/dev/null | head -10 || true
+          exit 1
+        fi
+
         OPLUS_MK="$OPLUS_DTS_DIR/Makefile"
 
-        if [ ! -d "$OPLUS_DTS_DIR" ]; then
-        echo "ERROR: $OPLUS_DTS_DIR does not exist — check DTS vendor symlinks"
-        exit 1
-        fi
-
         if [ -f "$OPLUS_MK" ]; then
-        if ! grep -q "lemonadev" "$OPLUS_MK"; then
-        echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
-        echo "  Injected lemonadev into kernel DTS oplus/Makefile"
+          if ! grep -q "lemonadev" "$OPLUS_MK"; then
+            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
+            echo "  Injected lemonadev into $OPLUS_MK"
+          else
+            echo "  lemonadev already present in $OPLUS_MK (no change needed)"
+          fi
         else
-        echo "  lemonadev already present in $OPLUS_MK"
-        fi
-        else
-        echo 'subdir-y += lemonadev' > "$OPLUS_MK"
-        echo "  Created kernel DTS oplus/Makefile with lemonadev"
+          echo 'subdir-y += lemonadev' > "$OPLUS_MK"
+          echo "  Created $OPLUS_MK with lemonadev"
         fi
 
-        # Also verify lemonadev/ directory and its own Makefile exist
+        # Confirm lemonadev/ and its Makefile are reachable
         if [ ! -d "$OPLUS_DTS_DIR/lemonadev" ]; then
-        echo "FATAL: $OPLUS_DTS_DIR/lemonadev directory not found!"
-        exit 1
+          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/ directory not found!"
+          exit 1
         fi
         if [ ! -f "$OPLUS_DTS_DIR/lemonadev/Makefile" ]; then
-        echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
-        exit 1
+          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
+          exit 1
         fi
-        echo "  lemonadev/ dir and Makefile confirmed OK"
+        echo "  lemonadev/ directory and Makefile confirmed reachable"
+        echo "  Final oplus/Makefile contents:"
+        cat "$OPLUS_MK"
+        echo
 
         echo ""
         echo "=== Generic symlink repair scan ==="
@@ -314,7 +344,7 @@ jobs:
           fi
         done
         [ "$ALL_OK" = "1" ] || exit 1
-
+        
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7 — Install build dependencies
     # ══════════════════════════════════════════════════════════════════════════
