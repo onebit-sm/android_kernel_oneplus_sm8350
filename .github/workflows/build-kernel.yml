@@ -624,6 +624,100 @@ jobs:
         du -h out/arch/arm64/boot/Image
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 11b — Inject lemonadev into oplus DTS Makefile
+    # (Must run AFTER kernel source is cloned and dts/vendor symlink exists,
+    #  but BEFORE make dtbs. The symlink dts/vendor → vendor_modules is
+    #  created by the kernel Makefile at build-prep time, so we resolve it
+    #  by following the symlink manually here.)
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Inject lemonadev into oplus DTS Makefile
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        export PATH="$CLANG_BIN_DIR:$PATH"
+
+        # Run the minimum make target that creates the out/ directory and
+        # resolves the dts/vendor symlink without starting a full build.
+        make O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          LLVM=1 LLVM_IAS=1 \
+          prepare 2>&1 | tail -5 || true
+
+        # Now find the real oplus DTS directory by following symlinks from
+        # the resolved dts/vendor path.
+        echo "=== Locating oplus DTS directory ==="
+
+        # Strategy 1: follow the dts/vendor symlink inside kernel out tree
+        VENDOR_DTS_REAL=$(readlink -f out/../arch/arm64/boot/dts/vendor 2>/dev/null || true)
+        # Strategy 2: follow it from the source tree directly
+        if [ -z "$VENDOR_DTS_REAL" ] || [ ! -d "$VENDOR_DTS_REAL" ]; then
+          VENDOR_DTS_REAL=$(readlink -f arch/arm64/boot/dts/vendor 2>/dev/null || true)
+        fi
+
+        echo "  dts/vendor resolved to: $VENDOR_DTS_REAL"
+
+        OPLUS_DTS_DIR=""
+        if [ -n "$VENDOR_DTS_REAL" ] && [ -d "$VENDOR_DTS_REAL/oplus" ]; then
+          OPLUS_DTS_DIR="$VENDOR_DTS_REAL/oplus"
+          echo "  Found oplus/ via vendor symlink: $OPLUS_DTS_DIR"
+        fi
+
+        # Strategy 3: broad find across vendor_modules (no symlink traversal needed)
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "  Symlink strategy failed — running broad find in vendor_modules..."
+          LEMON_DIR=$(find $GITHUB_WORKSPACE/vendor_modules -name "lemonadev" -type d 2>/dev/null | head -1)
+          if [ -n "$LEMON_DIR" ]; then
+            OPLUS_DTS_DIR=$(dirname "$LEMON_DIR")
+            echo "  Found via find: $OPLUS_DTS_DIR"
+          fi
+        fi
+
+        if [ -z "$OPLUS_DTS_DIR" ]; then
+          echo "FATAL: Cannot find oplus DTS directory containing lemonadev/"
+          echo "--- Dumping all 'oplus' dirs in vendor_modules ---"
+          find $GITHUB_WORKSPACE/vendor_modules -type d -name "oplus" 2>/dev/null | head -20
+          echo "--- Dumping all 'lemonadev' dirs everywhere ---"
+          find $GITHUB_WORKSPACE -type d -name "lemonadev" 2>/dev/null | head -10
+          exit 1
+        fi
+
+        # Verify lemonadev exists
+        if [ ! -d "$OPLUS_DTS_DIR/lemonadev" ]; then
+          echo "FATAL: lemonadev/ not found under $OPLUS_DTS_DIR"
+          ls "$OPLUS_DTS_DIR/"
+          exit 1
+        fi
+
+        # Inject into oplus/Makefile
+        OPLUS_MK="$OPLUS_DTS_DIR/Makefile"
+        if [ -f "$OPLUS_MK" ]; then
+          if ! grep -q "lemonadev" "$OPLUS_MK"; then
+            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
+            echo "  Injected lemonadev into $OPLUS_MK"
+          else
+            echo "  lemonadev already present — no change"
+          fi
+        else
+          echo 'subdir-y += lemonadev' > "$OPLUS_MK"
+          echo "  Created $OPLUS_MK with lemonadev"
+        fi
+
+        # Also ensure lemonadev/Makefile exists
+        if [ ! -f "$OPLUS_DTS_DIR/lemonadev/Makefile" ]; then
+          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
+          ls "$OPLUS_DTS_DIR/lemonadev/"
+          exit 1
+        fi
+
+        echo "  Final oplus/Makefile:"
+        cat "$OPLUS_MK"
+        echo "  lemonadev/Makefile first 5 lines:"
+        head -5 "$OPLUS_DTS_DIR/lemonadev/Makefile"
+        echo "=== lemonadev injection complete ==="
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 12 — Build DTBs
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build DTBs
@@ -637,8 +731,12 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log \
-          && echo "DTBs built successfully" \
+          dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
+
+        if [ ${PIPESTATUS[0]} -ne 0 ]; then
+          echo "FATAL: DTB build failed!"
+          exit 1
+        fi
 
         echo ""
         echo "=== Lemonade DTB check ==="
@@ -647,7 +745,7 @@ jobs:
           echo "FATAL: No lemonade DTBs were built!"
           exit 1
         fi
-        find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | while read f; do echo "  FOUND: $f"; done
+        find out/arch/arm64/boot/dts -name "*lemonad*.dtb" | while read f; do echo "  FOUND: $f"; done
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 13 — Build in-tree kernel modules
