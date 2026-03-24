@@ -234,21 +234,39 @@ jobs:
         done
 
         echo "=== Fixing lemonadev DTB inclusion ==="
-        OPLUS_REAL_DIR="$GITHUB_WORKSPACE/vendor_modules/vendor/qcom/proprietary/devicetree/oplus"
-        OPLUS_MK="$OPLUS_REAL_DIR/Makefile"
+        KERNEL=$GITHUB_WORKSPACE/kernel_source
 
-        if [ -d "$OPLUS_REAL_DIR" ]; then
-          if [ -f "$OPLUS_MK" ] && ! grep -q "lemonadev" "$OPLUS_MK"; then
-            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
-            echo "  Injected lemonadev into real oplus/Makefile"
-          elif [ ! -f "$OPLUS_MK" ]; then
-            echo 'subdir-y += lemonadev' > "$OPLUS_MK"
-            echo "  Created real oplus/Makefile with lemonadev"
-          fi
-        else
-          echo "  WARNING: Real oplus directory not found at $OPLUS_REAL_DIR"
+        # The path that matters is inside the kernel's own DTS vendor tree
+        OPLUS_DTS_DIR="$KERNEL/arch/arm64/boot/dts/vendor/oplus"
+        OPLUS_MK="$OPLUS_DTS_DIR/Makefile"
+
+        if [ ! -d "$OPLUS_DTS_DIR" ]; then
+        echo "ERROR: $OPLUS_DTS_DIR does not exist — check DTS vendor symlinks"
+        exit 1
         fi
-        echo
+
+        if [ -f "$OPLUS_MK" ]; then
+        if ! grep -q "lemonadev" "$OPLUS_MK"; then
+        echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
+        echo "  Injected lemonadev into kernel DTS oplus/Makefile"
+        else
+        echo "  lemonadev already present in $OPLUS_MK"
+        fi
+        else
+        echo 'subdir-y += lemonadev' > "$OPLUS_MK"
+        echo "  Created kernel DTS oplus/Makefile with lemonadev"
+        fi
+
+        # Also verify lemonadev/ directory and its own Makefile exist
+        if [ ! -d "$OPLUS_DTS_DIR/lemonadev" ]; then
+        echo "FATAL: $OPLUS_DTS_DIR/lemonadev directory not found!"
+        exit 1
+        fi
+        if [ ! -f "$OPLUS_DTS_DIR/lemonadev/Makefile" ]; then
+        echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
+        exit 1
+        fi
+        echo "  lemonadev/ dir and Makefile confirmed OK"
 
         echo ""
         echo "=== Generic symlink repair scan ==="
@@ -582,7 +600,7 @@ jobs:
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        make -j$(nproc --all) -k O=out \
+        make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
@@ -591,7 +609,6 @@ jobs:
           LLVM_IAS=1 \
           dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log \
           && echo "DTBs built successfully" \
-          || echo "WARNING: DTB build had errors (non-fatal — Image still usable)"
 
         echo ""
         echo "=== Lemonade DTB check ==="
@@ -725,10 +742,13 @@ jobs:
         echo "Kernel Image: OK"
 
         # Only copy lemonade DTBs to avoid booting the wrong reference board
-        DTB_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | wc -l)
+        DTB_COUNT=$(find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
+        -name "*lemonad*.dtb" 2>/dev/null | wc -l)
         if [ "$DTB_COUNT" -gt "0" ]; then
-          mkdir -p $AK/dtbs
-          find out/arch/arm64/boot/dts -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
+        mkdir -p $AK/dtbs
+        find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
+        -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
+    
         else
           echo "FATAL: No lemonade DTBs found during packaging. Aborting to prevent brick."
           exit 1
