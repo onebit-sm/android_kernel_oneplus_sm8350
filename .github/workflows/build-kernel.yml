@@ -582,18 +582,31 @@ jobs:
           # Also handle 4-space indent in case editor used that
           sed -i '/^\t/! s/^    /\t/' "$LEMON_REAL"
 
+          # FIX: Make interprets TAB-prefixed lines as recipes (shell commands).
+          # In the 'else' branch, "dtb-... +=\n\tvalue" causes:
+          #   "recipe commences before first target"
+          # because Make sees the TAB as a recipe start, not a variable continuation.
+          # Fix: insert backslash at end of any line ending with += so the next
+          # TAB-indented line is treated as a value continuation.
+          sed -i '/+=$/s/$/ \\/' "$LEMON_REAL"
+
           echo "=== Lines 10-20 after fix ==="
           sed -n '10,20p' "$LEMON_REAL" | cat -A
+          echo "=== Full Makefile (%% debug) ==="
+          cat -An "$LEMON_REAL"
 
           CR_LEFT=$(grep -cP '\r' "$LEMON_REAL" || echo 0)
           echo "Carriage returns remaining: $CR_LEFT (must be 0)"
 
-          # Verify no "missing separator" by doing a dry-run parse
-          make --dry-run -f "$LEMON_REAL" 2>&1 | grep -i "missing separator" && {
-            echo "FATAL: lemonadev/Makefile still has separator errors after fix!"
+          # Verify no "missing separator" or "recipe commences" errors
+          MAKE_ERRS=$(make --dry-run -f "$LEMON_REAL" 2>&1 | grep -iE "missing separator|recipe commences" || true)
+          if [ -n "$MAKE_ERRS" ]; then
+            echo "FATAL: lemonadev/Makefile has syntax errors after fix!"
+            echo "$MAKE_ERRS"
             cat -A "$LEMON_REAL"
             exit 1
-          } || echo "  Makefile syntax check: OK"
+          fi
+          echo "  Makefile syntax check: OK"
 
         else
           echo "FATAL: lemonadev/Makefile not found anywhere!"
@@ -743,6 +756,13 @@ jobs:
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
+        # Suppress non-fatal DTC warnings from upstream yupik DTSI files.
+        # These are genuine DTS bugs in Qualcomm vendor code (wrong phandle
+        # references in yupik-pcie.dtsi, yupik-pinctrl.dtsi and decimal
+        # port addresses in yupik-coresight.dtsi) but they do NOT affect
+        # the OnePlus 9 Pro (lahaina platform). Without suppression, DTC
+        # treats them as errors and aborts the build.
+        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port"
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -750,6 +770,7 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
+          DTC_FLAGS="$DTC_FLAGS" \
           dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
 
         if [ ${PIPESTATUS[0]} -ne 0 ]; then
