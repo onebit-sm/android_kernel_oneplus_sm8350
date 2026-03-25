@@ -787,35 +787,35 @@ jobs:
               $GITHUB_WORKSPACE/anykernel/dtb \
               $GITHUB_WORKSPACE/anykernel/dtbo.img
 
-        printf '%s\n' \
-          '#!/bin/sh'  \
-          '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14' \
-          '' \
-          'properties() { '"'" \
-          'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"' \
-          'do.devicecheck=1' \
-          'do.modules=1' \
-          'do.systemless=1' \
-          'do.cleanup=1' \
-          'do.cleanuponabort=0' \
-          'device.name1=lemonadep' \
-          'device.name2=lemonade' \
-          'device.name3=OnePlus9Pro' \
-          'device.name4=' \
-          'device.name5=' \
-          'supported.versions=14' \
-          '"'"' }' \
-          '' \
-          'block=boot' \
-          'is_slot_device=1' \
-          'ramdisk_compression=auto' \
-          'patch_vbmeta_flag=auto' \
-          '' \
-          '. tools/ak3-core.sh' \
-          '' \
-          'dump_boot' \
-          'write_boot' \
-          > $GITHUB_WORKSPACE/anykernel/anykernel.sh
+        (
+          echo '#!/bin/sh'
+          echo '# AnyKernel3 - OnePlus 9 Pro (lemonadep) | Android 14'
+          echo ''
+          echo "properties() { '"
+          echo 'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"'
+          echo 'do.devicecheck=1'
+          echo 'do.modules=1'
+          echo 'do.systemless=1'
+          echo 'do.cleanup=1'
+          echo 'do.cleanuponabort=0'
+          echo 'device.name1=lemonadep'
+          echo 'device.name2=lemonade'
+          echo 'device.name3=OnePlus9Pro'
+          echo 'device.name4='
+          echo 'device.name5='
+          echo 'supported.versions=14'
+          echo "' }"
+          echo ''
+          echo 'block=boot'
+          echo 'is_slot_device=1'
+          echo 'ramdisk_compression=auto'
+          echo 'patch_vbmeta_flag=auto'
+          echo ''
+          echo '. tools/ak3-core.sh'
+          echo ''
+          echo 'dump_boot'
+          echo 'write_boot'
+        ) > $GITHUB_WORKSPACE/anykernel/anykernel.sh
 
         echo "=== anykernel.sh ==="
         cat $GITHUB_WORKSPACE/anykernel/anykernel.sh
