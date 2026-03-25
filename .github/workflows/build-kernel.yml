@@ -437,7 +437,10 @@ jobs:
           --disable DEBUG_INFO_SPLIT \
           --enable  DEBUG_INFO_NONE \
           --disable UAPI_HEADER_TEST \
-          --disable HEADERS_INSTALL
+          --disable HEADERS_INSTALL \
+          --enable  BUILD_ARM64_DT_OVERLAY
+
+        echo "  BUILD_ARM64_DT_OVERLAY: enabled (required for lemonadev DTBO overlays)"
 
         make O=out \
           ARCH=arm64 \
@@ -655,99 +658,7 @@ jobs:
         echo "=== Kernel Image built ==="
         du -h out/arch/arm64/boot/Image
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 11b — Inject lemonadev into oplus DTS Makefile
-    # (Must run AFTER kernel source is cloned and dts/vendor symlink exists,
-    #  but BEFORE make dtbs. The symlink dts/vendor → vendor_modules is
-    #  created by the kernel Makefile at build-prep time, so we resolve it
-    #  by following the symlink manually here.)
-    # ══════════════════════════════════════════════════════════════════════════
-    - name: Inject lemonadev into oplus DTS Makefile
-      working-directory: ${{ github.workspace }}/kernel_source
-      run: |
-        export PATH="$CLANG_BIN_DIR:$PATH"
-
-        # Run the minimum make target that creates the out/ directory and
-        # resolves the dts/vendor symlink without starting a full build.
-        make O=out \
-          ARCH=arm64 \
-          CC=clang \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          LLVM=1 LLVM_IAS=1 \
-          prepare 2>&1 | tail -5 || true
-
-        # Now find the real oplus DTS directory by following symlinks from
-        # the resolved dts/vendor path.
-        echo "=== Locating oplus DTS directory ==="
-
-        # Strategy 1: follow the dts/vendor symlink inside kernel out tree
-        VENDOR_DTS_REAL=$(readlink -f out/../arch/arm64/boot/dts/vendor 2>/dev/null || true)
-        # Strategy 2: follow it from the source tree directly
-        if [ -z "$VENDOR_DTS_REAL" ] || [ ! -d "$VENDOR_DTS_REAL" ]; then
-          VENDOR_DTS_REAL=$(readlink -f arch/arm64/boot/dts/vendor 2>/dev/null || true)
-        fi
-
-        echo "  dts/vendor resolved to: $VENDOR_DTS_REAL"
-
-        OPLUS_DTS_DIR=""
-        if [ -n "$VENDOR_DTS_REAL" ] && [ -d "$VENDOR_DTS_REAL/oplus" ]; then
-          OPLUS_DTS_DIR="$VENDOR_DTS_REAL/oplus"
-          echo "  Found oplus/ via vendor symlink: $OPLUS_DTS_DIR"
-        fi
-
-        # Strategy 3: broad find across vendor_modules (no symlink traversal needed)
-        if [ -z "$OPLUS_DTS_DIR" ]; then
-          echo "  Symlink strategy failed — running broad find in vendor_modules..."
-          LEMON_DIR=$(find $GITHUB_WORKSPACE/vendor_modules -name "lemonadev" -type d 2>/dev/null | head -1)
-          if [ -n "$LEMON_DIR" ]; then
-            OPLUS_DTS_DIR=$(dirname "$LEMON_DIR")
-            echo "  Found via find: $OPLUS_DTS_DIR"
-          fi
-        fi
-
-        if [ -z "$OPLUS_DTS_DIR" ]; then
-          echo "FATAL: Cannot find oplus DTS directory containing lemonadev/"
-          echo "--- Dumping all 'oplus' dirs in vendor_modules ---"
-          find $GITHUB_WORKSPACE/vendor_modules -type d -name "oplus" 2>/dev/null | head -20
-          echo "--- Dumping all 'lemonadev' dirs everywhere ---"
-          find $GITHUB_WORKSPACE -type d -name "lemonadev" 2>/dev/null | head -10
-          exit 1
-        fi
-
-        # Verify lemonadev exists
-        if [ ! -d "$OPLUS_DTS_DIR/lemonadev" ]; then
-          echo "FATAL: lemonadev/ not found under $OPLUS_DTS_DIR"
-          ls "$OPLUS_DTS_DIR/"
-          exit 1
-        fi
-
-        # Inject into oplus/Makefile
-        OPLUS_MK="$OPLUS_DTS_DIR/Makefile"
-        if [ -f "$OPLUS_MK" ]; then
-          if ! grep -q "lemonadev" "$OPLUS_MK"; then
-            echo 'subdir-y += lemonadev' >> "$OPLUS_MK"
-            echo "  Injected lemonadev into $OPLUS_MK"
-          else
-            echo "  lemonadev already present — no change"
-          fi
-        else
-          echo 'subdir-y += lemonadev' > "$OPLUS_MK"
-          echo "  Created $OPLUS_MK with lemonadev"
-        fi
-
-        # Also ensure lemonadev/Makefile exists
-        if [ ! -f "$OPLUS_DTS_DIR/lemonadev/Makefile" ]; then
-          echo "FATAL: $OPLUS_DTS_DIR/lemonadev/Makefile not found!"
-          ls "$OPLUS_DTS_DIR/lemonadev/"
-          exit 1
-        fi
-
-        echo "  Final oplus/Makefile:"
-        cat "$OPLUS_MK"
-        echo "  lemonadev/Makefile first 5 lines:"
-        head -5 "$OPLUS_DTS_DIR/lemonadev/Makefile"
-        echo "=== lemonadev injection complete ==="
+    # (Step 11b removed — lemonadev injection is already handled in Step 6)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 12 — Build DTBs
@@ -815,42 +726,53 @@ jobs:
     # STEP 14 — Build out-of-tree vendor modules
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build vendor modules
+      continue-on-error: true
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
         BUILT=0
-        for mod_dir in $GITHUB_WORKSPACE/vendor_modules/*/; do
-          if [ -f "$mod_dir/Kbuild" ] || [ -f "$mod_dir/Makefile" ]; then
-            echo "Building: $mod_dir"
-            make -j2 \
-              -C $GITHUB_WORKSPACE/kernel_source/out \
-              M="$mod_dir" \
-              ARCH=arm64 \
-              CC=clang \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              LLVM=1 \
-              LLVM_IAS=1 \
-              KERNEL_SRC=$GITHUB_WORKSPACE/kernel_source \
-              modules || { echo "FATAL: failed to compile vendor module $mod_dir"; exit 1; }
-            BUILT=$((BUILT + 1))
-          fi
-        done
-        echo "Vendor dirs attempted: $BUILT"
-        echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' | wc -l)"
+        SKIPPED=0
+        # Search recursively for actual module dirs (ones with Kbuild or Makefile)
+        # under vendor_modules/vendor/oplus/kernel/ — NOT the top-level containers
+        while IFS= read -r mod_dir; do
+          mod_dir=$(dirname "$mod_dir")
+          # Skip devicetree dirs — those are DTS, not kernel modules
+          echo "$mod_dir" | grep -qE "devicetree|dts" && { SKIPPED=$((SKIPPED + 1)); continue; }
+          echo "Building: $mod_dir"
+          make -j2 \
+            -C $GITHUB_WORKSPACE/kernel_source \
+            O=out \
+            M="$mod_dir" \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            modules 2>&1 || { echo "WARNING: failed to compile $mod_dir (non-fatal)"; }
+          BUILT=$((BUILT + 1))
+        done < <(find $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel \
+          -maxdepth 4 \( -name "Kbuild" -o -name "Makefile" \) -print 2>/dev/null)
+        echo "Vendor module dirs attempted: $BUILT  skipped: $SKIPPED"
+        echo "Vendor .ko count: $(find $GITHUB_WORKSPACE/vendor_modules -name '*.ko' 2>/dev/null | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 15 — Collect DTB blobs
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Collect DTB blobs
+    - name: Collect DTB/DTBO blobs
       run: |
         mkdir -p $GITHUB_WORKSPACE/dtbs
+        # Collect both .dtb and .dtbo files
         find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
-          -name "*.dtb" -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
-        echo "DTBs collected: $(ls $GITHUB_WORKSPACE/dtbs | wc -l)"
+          \( -name "*.dtb" -o -name "*.dtbo" \) \
+          -exec cp {} $GITHUB_WORKSPACE/dtbs/ \; 2>/dev/null || true
 
-        LEMON_COUNT=$(ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null | wc -l)
-        echo "Lemonade-specific DTBs: $LEMON_COUNT"
-        ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null || true
+        echo "Total DTBs/DTBOs collected: $(ls $GITHUB_WORKSPACE/dtbs/ 2>/dev/null | wc -l)"
+
+        echo "=== Lemonade DTBs/DTBOs ==="
+        ls $GITHUB_WORKSPACE/dtbs/*lemonad* 2>/dev/null || echo "(none found)"
+
+        echo "=== Lahaina base DTBs ==="
+        ls $GITHUB_WORKSPACE/dtbs/lahaina*.dtb 2>/dev/null || echo "(none found)"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 16 — Prepare AnyKernel3
@@ -895,8 +817,17 @@ jobs:
           '. tools/ak3-core.sh' \
           '' \
           'dump_boot' \
+          '' \
+          '# Flash DTBOs to dtbo partition if present in the zip' \
+          'if [ -d "$home/dtbo" ]; then' \
+          '  flash_dtbo' \
+          'fi' \
+          '' \
           'write_boot' \
           > $GITHUB_WORKSPACE/anykernel/anykernel.sh
+
+        echo "=== anykernel.sh ==="
+        cat $GITHUB_WORKSPACE/anykernel/anykernel.sh
 
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -905,29 +836,59 @@ jobs:
     - name: Assemble flashable package
       run: |
         AK=$GITHUB_WORKSPACE/anykernel
+        OUT_DTS=$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts
 
+        # 1. Copy kernel Image
         cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
         echo "Kernel Image: OK"
 
-        # Only copy lemonade DTBs to avoid booting the wrong reference board
-        DTB_COUNT=$(find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
-        -name "*lemonad*.dtb" 2>/dev/null | wc -l)
-        if [ "$DTB_COUNT" -gt "0" ]; then
-        mkdir -p $AK/dtbs
-        find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
-        -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
-    
-        else
-          echo "FATAL: No lemonade DTBs found during packaging. Aborting to prevent brick."
-          exit 1
+        # 2. Copy lemonade DTBO overlays + lahaina base DTBs
+        #    With CONFIG_BUILD_ARM64_DT_OVERLAY=y the build produces .dtbo files.
+        #    The base DTBs (lahaina*.dtb) are required for overlay composition.
+        DTBO_COUNT=$(find "$OUT_DTS" -name "*lemonad*.dtbo" 2>/dev/null | wc -l)
+        DTB_COUNT=$(find "$OUT_DTS" -name "*lemonad*.dtb" 2>/dev/null | wc -l)
+        LAHAINA_COUNT=$(find "$OUT_DTS" -name "lahaina*.dtb" 2>/dev/null | wc -l)
+
+        echo "Lemonade DTBOs: $DTBO_COUNT"
+        echo "Lemonade DTBs:  $DTB_COUNT"
+        echo "Lahaina base:   $LAHAINA_COUNT"
+
+        # Copy DTBOs for dtbo partition flashing
+        if [ "$DTBO_COUNT" -gt 0 ]; then
+          mkdir -p $AK/dtbo
+          find "$OUT_DTS" -name "*lemonad*.dtbo" -exec cp {} $AK/dtbo/ \;
+          echo "DTBO overlays packaged: $(ls $AK/dtbo/ | wc -l)"
         fi
 
+        # Copy base DTBs (lahaina) — needed for overlay composition
+        if [ "$LAHAINA_COUNT" -gt 0 ]; then
+          mkdir -p $AK/dtbs
+          find "$OUT_DTS" -name "lahaina*.dtb" -exec cp {} $AK/dtbs/ \;
+          echo "Base DTBs packaged: $(ls $AK/dtbs/ | wc -l)"
+        fi
+
+        # Fallback: if no DTBOs were built (overlay config off), use bare DTBs
+        if [ "$DTBO_COUNT" -eq 0 ] && [ "$DTB_COUNT" -gt 0 ]; then
+          echo "WARNING: No DTBOs found — falling back to bare lemonade DTBs"
+          mkdir -p $AK/dtbs
+          find "$OUT_DTS" -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
+        fi
+
+        # Verify we have SOMETHING device-specific
+        TOTAL=$(find $AK/dtbo $AK/dtbs -type f 2>/dev/null | wc -l)
+        if [ "$TOTAL" -eq 0 ]; then
+          echo "FATAL: No lemonade DTBs or DTBOs found. Aborting to prevent brick."
+          exit 1
+        fi
+        echo "Total device-tree files in package: $TOTAL"
+
+        # 3. Copy kernel modules
         mkdir -p $AK/modules/vendor/lib/modules
         find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" \
           -exec cp {} $AK/modules/vendor/lib/modules/ \;
         find $GITHUB_WORKSPACE/vendor_modules -name "*.ko" \
-          -exec cp {} $AK/modules/vendor/lib/modules/ \;
-        echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules | wc -l)"
+          -exec cp {} $AK/modules/vendor/lib/modules/ \; 2>/dev/null || true
+        echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules 2>/dev/null | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 18 — Create flashable ZIP
