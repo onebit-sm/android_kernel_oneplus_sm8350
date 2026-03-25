@@ -437,10 +437,7 @@ jobs:
           --disable DEBUG_INFO_SPLIT \
           --enable  DEBUG_INFO_NONE \
           --disable UAPI_HEADER_TEST \
-          --disable HEADERS_INSTALL \
-          --enable  BUILD_ARM64_DT_OVERLAY
-
-        echo "  BUILD_ARM64_DT_OVERLAY: enabled (required for lemonadev DTBO overlays)"
+          --disable HEADERS_INSTALL
 
         make O=out \
           ARCH=arm64 \
@@ -817,12 +814,6 @@ jobs:
           '. tools/ak3-core.sh' \
           '' \
           'dump_boot' \
-          '' \
-          '# Flash DTBOs to dtbo partition if present in the zip' \
-          'if [ -d "$home/dtbo" ]; then' \
-          '  flash_dtbo' \
-          'fi' \
-          '' \
           'write_boot' \
           > $GITHUB_WORKSPACE/anykernel/anykernel.sh
 
@@ -836,53 +827,12 @@ jobs:
     - name: Assemble flashable package
       run: |
         AK=$GITHUB_WORKSPACE/anykernel
-        OUT_DTS=$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts
 
-        # 1. Copy kernel Image
+        # Kernel Image
         cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
         echo "Kernel Image: OK"
 
-        # 2. Copy lemonade DTBO overlays + lahaina base DTBs
-        #    With CONFIG_BUILD_ARM64_DT_OVERLAY=y the build produces .dtbo files.
-        #    The base DTBs (lahaina*.dtb) are required for overlay composition.
-        DTBO_COUNT=$(find "$OUT_DTS" -name "*lemonad*.dtbo" 2>/dev/null | wc -l)
-        DTB_COUNT=$(find "$OUT_DTS" -name "*lemonad*.dtb" 2>/dev/null | wc -l)
-        LAHAINA_COUNT=$(find "$OUT_DTS" -name "lahaina*.dtb" 2>/dev/null | wc -l)
-
-        echo "Lemonade DTBOs: $DTBO_COUNT"
-        echo "Lemonade DTBs:  $DTB_COUNT"
-        echo "Lahaina base:   $LAHAINA_COUNT"
-
-        # Copy DTBOs for dtbo partition flashing
-        if [ "$DTBO_COUNT" -gt 0 ]; then
-          mkdir -p $AK/dtbo
-          find "$OUT_DTS" -name "*lemonad*.dtbo" -exec cp {} $AK/dtbo/ \;
-          echo "DTBO overlays packaged: $(ls $AK/dtbo/ | wc -l)"
-        fi
-
-        # Copy base DTBs (lahaina) — needed for overlay composition
-        if [ "$LAHAINA_COUNT" -gt 0 ]; then
-          mkdir -p $AK/dtbs
-          find "$OUT_DTS" -name "lahaina*.dtb" -exec cp {} $AK/dtbs/ \;
-          echo "Base DTBs packaged: $(ls $AK/dtbs/ | wc -l)"
-        fi
-
-        # Fallback: if no DTBOs were built (overlay config off), use bare DTBs
-        if [ "$DTBO_COUNT" -eq 0 ] && [ "$DTB_COUNT" -gt 0 ]; then
-          echo "WARNING: No DTBOs found — falling back to bare lemonade DTBs"
-          mkdir -p $AK/dtbs
-          find "$OUT_DTS" -name "*lemonad*.dtb" -exec cp {} $AK/dtbs/ \;
-        fi
-
-        # Verify we have SOMETHING device-specific
-        TOTAL=$(find $AK/dtbo $AK/dtbs -type f 2>/dev/null | wc -l)
-        if [ "$TOTAL" -eq 0 ]; then
-          echo "FATAL: No lemonade DTBs or DTBOs found. Aborting to prevent brick."
-          exit 1
-        fi
-        echo "Total device-tree files in package: $TOTAL"
-
-        # 3. Copy kernel modules
+        # Modules
         mkdir -p $AK/modules/vendor/lib/modules
         find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" \
           -exec cp {} $AK/modules/vendor/lib/modules/ \;
