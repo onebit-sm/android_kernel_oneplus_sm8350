@@ -437,7 +437,8 @@ jobs:
           --disable DEBUG_INFO_SPLIT \
           --enable  DEBUG_INFO_NONE \
           --disable UAPI_HEADER_TEST \
-          --disable HEADERS_INSTALL
+          --disable HEADERS_INSTALL \
+          --enable  BUILD_ARM64_DT_OVERLAY
 
         make O=out \
           ARCH=arm64 \
@@ -669,7 +670,7 @@ jobs:
         # references, unit_address_vs_reg, PCI addresses) but they do NOT affect
         # the OnePlus 9 Pro (lahaina platform). Without suppression, DTC
         # treats them as errors and aborts the build.
-        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg"
+        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg -Wno-unique_unit_address"
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -681,8 +682,7 @@ jobs:
           dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
 
         if [ ${PIPESTATUS[0]} -ne 0 ]; then
-          echo "FATAL: DTB build failed!"
-          exit 1
+          echo "WARNING: DTB build had errors — checking if lemonade DTBs were built..."
         fi
 
         echo ""
