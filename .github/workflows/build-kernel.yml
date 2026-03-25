@@ -570,20 +570,39 @@ jobs:
 
         if [ -n "$LEMON_REAL" ]; then
           echo "Found: $LEMON_REAL"
-          # Strip \r
+
+          # Strip \r (CRLF)
           sed -i 's/\r//' "$LEMON_REAL"
-          echo "=== Lines 12-18 after fix ==="
-          sed -n '12,18p' "$LEMON_REAL" | cat -A
+
+          # FIX: convert leading spaces to tabs on recipe lines.
+          # Make requires TAB as the recipe separator; spaces cause
+          # "missing separator" errors. This converts any line that
+          # starts with 8 spaces (common editor default) to a TAB.
+          sed -i 's/^        /\t/' "$LEMON_REAL"
+          # Also handle 4-space indent in case editor used that
+          sed -i '/^\t/! s/^    /\t/' "$LEMON_REAL"
+
+          echo "=== Lines 10-20 after fix ==="
+          sed -n '10,20p' "$LEMON_REAL" | cat -A
+
           CR_LEFT=$(grep -cP '\r' "$LEMON_REAL" || echo 0)
           echo "Carriage returns remaining: $CR_LEFT (must be 0)"
+
+          # Verify no "missing separator" by doing a dry-run parse
+          make --dry-run -f "$LEMON_REAL" 2>&1 | grep -i "missing separator" && {
+            echo "FATAL: lemonadev/Makefile still has separator errors after fix!"
+            cat -A "$LEMON_REAL"
+            exit 1
+          } || echo "  Makefile syntax check: OK"
+
         else
           echo "FATAL: lemonadev/Makefile not found anywhere!"
           exit 1
         fi
 
-        # Scan all vendor DTS Makefiles through symlinks
+        # Scan all vendor DTS Makefiles through symlinks — strip CRLF from all
         DTS_VENDOR="arch/arm64/boot/dts/vendor"
-        [ -d "$DTS_VENDOR" ] || exit 0
+        [ -d "$DTS_VENDOR" ] || { echo "dts/vendor not present yet — skipping bulk scan"; exit 0; }
         find -L "$DTS_VENDOR" \( -name "Makefile" -o -name "Kbuild" \) \
           | while read -r mkfile; do
           sed -i 's/\r//' "$mkfile" 2>/dev/null || true
