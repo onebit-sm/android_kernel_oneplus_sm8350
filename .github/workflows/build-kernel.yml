@@ -588,8 +588,9 @@ jobs:
           #   "recipe commences before first target"
           # Also, CONFIG_ARCH_LAHAINA isn't always set in the defconfig, causing
           # the variable to evaluate to "dtb-", which make dtbs ignores.
-          # Fix: explicitly replace it with "dtb-y += \" to ensure it builds.
+          # Fix: explicitly replace both dtb- and dtbo- to dtb-y / dtbo-y to ensure it builds.
           sed -i 's/dtb-\$(CONFIG_ARCH_LAHAINA) +=/dtb-y += \\/' "$LEMON_REAL"
+          sed -i 's/dtbo-\$(CONFIG_ARCH_LAHAINA) +=/dtbo-y += \\/' "$LEMON_REAL"
 
           echo "=== Lines 10-20 after fix ==="
           sed -n '10,20p' "$LEMON_REAL" | cat -A
@@ -687,7 +688,7 @@ jobs:
 
         echo ""
         echo "=== Lemonade DTB check ==="
-        LEMON_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb" 2>/dev/null | wc -l)
+        LEMON_COUNT=$(find out/arch/arm64/boot/dts -name "*lemonad*.dtb*" 2>/dev/null | wc -l)
         if [ "$LEMON_COUNT" -eq "0" ]; then
           echo "FATAL: No lemonade DTBs were built!"
           exit 1
