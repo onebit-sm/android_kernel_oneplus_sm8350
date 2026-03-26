@@ -948,12 +948,24 @@ jobs:
 
         # ── 3. Get magiskboot (x86_64 Linux binary) ──────────────────────
         # AnyKernel3's tools/magiskboot is ARM64 (for Android devices).
-        # We need the x86_64 Linux version for the CI runner.
-        echo "Downloading magiskboot for Linux x86_64..."
-        wget -qO magiskboot \
-          "https://github.com/topjohnwu/Magisk/releases/latest/download/magiskboot" \
-          || cp $GITHUB_WORKSPACE/anykernel/tools/magiskboot ./magiskboot
-        chmod +x magiskboot
+        # We extract the x86_64 Linux version directly from the official Magisk APK.
+        echo "Downloading magiskboot from official Magisk APK..."
+        LATEST_APK_URL=$(curl -sL https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -oP '"browser_download_url": "\K(.*Magisk-v.*\.apk)(?=")' | head -1)
+        if [ -z "$LATEST_APK_URL" ]; then
+          echo "Rate limited or failed to get latest, using fallback URL..."
+          LATEST_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk"
+        fi
+        
+        wget -qO magisk.apk "$LATEST_APK_URL"
+        unzip -j magisk.apk lib/x86_64/libmagiskboot.so -d . || true
+        
+        if [ -f "libmagiskboot.so" ]; then
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+        else
+          echo "FATAL: Failed to extract libmagiskboot.so from downloaded APK"
+          exit 1
+        fi
 
         # Verify magiskboot works
         ./magiskboot 2>&1 | head -3 || {
