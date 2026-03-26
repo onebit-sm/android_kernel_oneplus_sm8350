@@ -359,15 +359,16 @@ jobs:
           curl \
           flex \
           git \
+          kmod \
           libelf-dev \
           libssl-dev \
           lz4 \
           make \
           python3 \
+          unzip \
           zip \
           zlib1g-dev \
           binutils-aarch64-linux-gnu
-
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
     # ══════════════════════════════════════════════════════════════════════════
@@ -614,8 +615,6 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          CONFIG_DEBUG_INFO=n \
-          CONFIG_DEBUG_INFO_NONE=y \
           Image > $GITHUB_WORKSPACE/build.log 2>&1
         tail -20 $GITHUB_WORKSPACE/build.log || true
 
@@ -632,8 +631,6 @@ jobs:
         fi
         echo "=== Kernel Image built ==="
         du -h out/arch/arm64/boot/Image
-
-    # (Step 11b removed — lemonadev injection is already handled in Step 6)
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 12 — Build DTBs
