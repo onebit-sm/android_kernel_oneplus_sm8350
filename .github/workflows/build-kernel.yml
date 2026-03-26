@@ -414,10 +414,13 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9 — Generate .config from defconfig
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Generate .config from defconfig
+    - name: Generate .config from defconfig and Spoof Version
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
+        
+        echo "-gd2a1055adeb0" > .scmversion
+        
         make O=out \
           ARCH=arm64 \
           CC=clang \
@@ -427,19 +430,17 @@ jobs:
           LLVM_IAS=1 \
           vendor/lahaina-qgki_defconfig
 
-        echo "=== Key config options ==="
-        grep -E "^CONFIG_LOCALVERSION=|^CONFIG_CC_IS_CLANG=" out/.config || true
-
         scripts/config --file out/.config \
-          --disable DEBUG_INFO \
-          --disable DEBUG_INFO_DWARF4 \
-          --disable DEBUG_INFO_REDUCED \
-          --disable DEBUG_INFO_SPLIT \
-          --enable  DEBUG_INFO_NONE \
-          --disable UAPI_HEADER_TEST \
-          --disable HEADERS_INSTALL \
-          --enable  BUILD_ARM64_DT_OVERLAY
+          --disable LOCALVERSION_AUTO \
+          --disable MODVERSIONS \
+          --disable MODULE_SIG_FORCE \
+          --disable MODULE_SIG_ALL \
+          --enable QCOM_COMMAND_DB \
+          --enable DRM_OPLUS_NOTIFY \
+          --enable DRM_OPLUS_PANEL_NOTIFY \
+          --enable OPLUS_BINDER_STATS_ENABLE
 
+        # Apply the changes
         make O=out \
           ARCH=arm64 \
           CC=clang \
@@ -448,14 +449,6 @@ jobs:
           LLVM=1 \
           LLVM_IAS=1 \
           olddefconfig
-
-        echo "=== Config verification ==="
-        echo -n "DEBUG_INFO:        "; grep "CONFIG_DEBUG_INFO_NONE\|^CONFIG_DEBUG_INFO=" out/.config | head -3 || echo "not set"
-        echo -n "UAPI_HEADER_TEST:  "; grep "UAPI_HEADER_TEST"  out/.config || echo "not set (good)"
-        echo -n "HEADERS_INSTALL:   "; grep "HEADERS_INSTALL"   out/.config || echo "not set (good)"
-        echo ""
-        echo "=== Disk space before build ==="
-        df -h /
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9b — Inject display-notifier stubs for vmlinux linkage
@@ -468,17 +461,9 @@ jobs:
 
         printf '%s\n' \
           '// SPDX-License-Identifier: GPL-2.0-only' \
-          '//' \
           '// Weak stub implementations for msm_drm / lcdinfo notifier symbols.' \
-          '// techpack/display provides the real implementations when loaded as' \
-          '// a module. These stubs allow vmlinux to link when display is =m.' \
-          '//' \
-          '// __weak means a built-in display driver (=y) automatically wins.' \
-          '//' \
-          '// EXPORT_SYMBOL_GPL is required here (not just for vmlinux linkage)' \
-          '// because loadable modules such as uff_fp_driver.ko also reference' \
-          '// msm_drm_register_client at module load time. Without the export,' \
-          '// modpost raises "undefined symbol" and the .ko cannot be loaded.' \
+          '// EXPORT_SYMBOL is required here because non-GPL loadable modules' \
+          '// reference these at load time.' \
           '' \
           '#include <linux/module.h>' \
           '#include <linux/notifier.h>' \
@@ -487,25 +472,25 @@ jobs:
           '{' \
           '	return 0;' \
           '}' \
-          'EXPORT_SYMBOL_GPL(msm_drm_register_client);' \
+          'EXPORT_SYMBOL(msm_drm_register_client);' \
           '' \
           'int __weak msm_drm_unregister_client(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
-          'EXPORT_SYMBOL_GPL(msm_drm_unregister_client);' \
+          'EXPORT_SYMBOL(msm_drm_unregister_client);' \
           '' \
           'int __weak register_lcdinfo_notifier(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
-          'EXPORT_SYMBOL_GPL(register_lcdinfo_notifier);' \
+          'EXPORT_SYMBOL(register_lcdinfo_notifier);' \
           '' \
           'int __weak unregister_lcdinfo_notifier(struct notifier_block *nb)' \
           '{' \
           '	return 0;' \
           '}' \
-          'EXPORT_SYMBOL_GPL(unregister_lcdinfo_notifier);' \
+          'EXPORT_SYMBOL(unregister_lcdinfo_notifier);' \
           > "$STUB_DIR/display_notifier_stubs.c"
 
         printf '%s\n' \
@@ -785,7 +770,7 @@ jobs:
           echo 'properties() {'
           echo 'kernel.string="Stock Base Kernel - OnePlus 9 Pro (Android 14)"'
           echo 'do.devicecheck=1'
-          echo 'do.modules=1'
+          echo 'do.modules=0'
           echo 'do.systemless=1'
           echo 'do.cleanup=1'
           echo 'do.cleanuponabort=0'
@@ -822,6 +807,26 @@ jobs:
         # Kernel Image
         cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
         echo "Kernel Image: OK"
+        
+        # Package DTB into AnyKernel3 so it routes to vendor_boot
+        echo "=== Finding lemonadep DTB ==="
+        DTB_SRC=$(find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
+          \( -name "lahaina-v2-v2.dtb" \
+          -o -name "*lemonadep*.dtb" \
+          -o -name "lahaina_sku3.dtb" \) \
+          2>/dev/null | head -1)
+          
+        if [ -z "$DTB_SRC" ]; then
+          DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*.dtb" | head -1)
+        fi
+        
+        if [ -f "$DTB_SRC" ]; then
+          cp "$DTB_SRC" $AK/dtb
+          echo "DTB packaged: $DTB_SRC"
+        else
+          echo "ERROR: No DTB found — vendor_boot will not be updated"
+          exit 1
+        fi
 
         # Modules
         mkdir -p $AK/modules/vendor/lib/modules
@@ -830,6 +835,92 @@ jobs:
         find $GITHUB_WORKSPACE/vendor_modules -name "*.ko" \
           -exec cp {} $AK/modules/vendor/lib/modules/ \; 2>/dev/null || true
         echo "Modules packaged: $(ls $AK/modules/vendor/lib/modules 2>/dev/null | wc -l)"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 17a — Create flashable ZIP
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Rebuild vendor_boot ramdisk with custom modules
+      run: |
+        WORK_DIR=$GITHUB_WORKSPACE/vendor_boot_work
+        mkdir -p $WORK_DIR/ramdisk
+        cd $WORK_DIR
+
+        # 1. Download the stock_vendor_boot.zip using the RAW github URL
+        echo "Downloading stock vendor_boot..."
+        wget -qO stock_vendor_boot.zip "https://raw.githubusercontent.com/smualemi/op9pro-kernel-build/main/stock_vendor_boot.zip"
+        
+        # 2. Unzip it
+        unzip stock_vendor_boot.zip
+        
+        # 3. Set the target image variable (assuming the extracted file is named vendor_boot.img)
+        # Adjust "vendor_boot.img" if your zip contains a differently named file.
+        STOCK_VENDOR_BOOT="$WORK_DIR/vendor_boot.img"
+        
+        if [ ! -f "$STOCK_VENDOR_BOOT" ]; then
+          echo "FATAL: vendor_boot.img not found after extracting ZIP!"
+          exit 1
+        fi
+
+        # Install required tools
+        sudo apt-get install -y lz4 cpio
+
+        # Bring in magiskboot from AnyKernel3
+        cp $GITHUB_WORKSPACE/anykernel/tools/magiskboot $WORK_DIR/
+        chmod +x $WORK_DIR/magiskboot
+
+        # Unpack the stock vendor_boot
+        ./magiskboot unpack $STOCK_VENDOR_BOOT
+
+        # Extract ramdisk
+        mkdir -p ramdisk
+        lz4 -d vendor_ramdisk vendor_ramdisk.cpio 2>/dev/null || cp vendor_ramdisk vendor_ramdisk.cpio
+        cd ramdisk
+        cpio -idm < ../vendor_ramdisk.cpio
+
+        # Replace modules
+        MODULES_DIR=$(find . -name "modules.load" -exec dirname {} \; | head -1)
+        echo "Vendor ramdisk modules dir: $MODULES_DIR"
+        rm -f $MODULES_DIR/*.ko
+
+        NEEDED=$(cat $MODULES_DIR/modules.load)
+        for mod_name in $NEEDED; do
+          KO_FILE=$(find $GITHUB_WORKSPACE/kernel_source/out -name "$(basename $mod_name)" | head -1)
+          if [ -n "$KO_FILE" ]; then
+            cp "$KO_FILE" "$MODULES_DIR/"
+            echo "  Placed: $(basename $KO_FILE)"
+          else
+            echo "  WARN: $mod_name not found in custom build"
+          fi
+        done
+
+        # Regenerate dependencies
+        KVER=$(cat $GITHUB_WORKSPACE/kernel_source/include/config/kernel.release 2>/dev/null || \
+               strings $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image | \
+               grep "Linux version" | head -1 | awk '{print $3}')
+        depmod -a -b . $KVER || true
+
+        # Repack ramdisk
+        cd $WORK_DIR/ramdisk
+        find . | cpio -H newc -o > ../vendor_ramdisk_new.cpio
+        lz4 -l -12 ../vendor_ramdisk_new.cpio ../vendor_ramdisk_new || cp ../vendor_ramdisk_new.cpio ../vendor_ramdisk_new
+
+        # Repack vendor_boot
+        cd $WORK_DIR
+        cp vendor_ramdisk_new vendor_ramdisk
+        
+        # Inject your newly built DTB into vendor_boot
+        DTB_FOR_VBOOT=$(find $GITHUB_WORKSPACE/dtbs -name "*.dtb" | head -1)
+        [ -f "$DTB_FOR_VBOOT" ] && cp "$DTB_FOR_VBOOT" dtb
+
+        ./magiskboot repack $STOCK_VENDOR_BOOT vendor_boot_custom.img
+        cp vendor_boot_custom.img $GITHUB_WORKSPACE/
+
+    - name: Upload Custom vendor_boot
+      uses: actions/upload-artifact@v4
+      with:
+        name: vendor-boot-custom
+        path: ${{ github.workspace }}/vendor_boot_custom.img
+        retention-days: 30
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 18 — Create flashable ZIP
