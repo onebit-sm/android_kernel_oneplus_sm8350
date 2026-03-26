@@ -645,6 +645,26 @@ jobs:
         echo "Makefile CRLF fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
+    # STEP 10b — Commit automated fixes to prevent dirty tree module suffix (+)
+    # ══════════════════════════════════════════════════════════════════════════
+    # The kernel script scripts/setlocalversion unconditionally appends a "+" 
+    # to the kernel version if the git tree is dirty (modified tracked files).
+    # Since we modified Kconfig, Makefile, stubs, and CRLFs, the tree is dirty.
+    # Committing these changes ensures the version string exactly matches 
+    # 5.4.254-qgki-gd2a1055adeb0 without the trailing +.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Commit automated fixes to prevent dirty tree output
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "actions@github.com"
+        git add -A
+        git commit -m "Automated build fixes: CRLF, Display Stubs, Makefiles" || true
+        
+        echo "Git working directory status:"
+        git status -s
+
+    # ══════════════════════════════════════════════════════════════════════════
     # STEP 11 — Build kernel Image
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build kernel Image
@@ -902,12 +922,13 @@ jobs:
         cd $WORK_DIR
 
         # ── 1. Download stock vendor_boot from smualemi's repo ────────────
-        echo "Downloading stock vendor_boot..."
-        wget -qO stock_vendor_boot.zip \
-          "https://raw.githubusercontent.com/smualemi/op9pro-kernel-build/main/stock_vendor_boot.zip"
+        echo "Downloading stock vendor_boot (handling Git LFS)..."
+        GIT_LFS_SKIP_SMUDGE=0 git clone --depth=1 --filter=blob:none \
+          https://github.com/smualemi/op9pro-kernel-build.git $WORK_DIR/vboot_repo
+        cp $WORK_DIR/vboot_repo/stock_vendor_boot.zip .
 
-        if [ ! -f "stock_vendor_boot.zip" ]; then
-          echo "FATAL: Failed to download stock_vendor_boot.zip"
+        if [ ! -f "stock_vendor_boot.zip" ] || [ $(stat -c%s stock_vendor_boot.zip) -lt 1024 ]; then
+          echo "FATAL: Failed to download stock_vendor_boot.zip or it is an LFS pointer."
           exit 1
         fi
         echo "Downloaded: $(du -h stock_vendor_boot.zip | cut -f1)"
@@ -929,24 +950,10 @@ jobs:
         # AnyKernel3's tools/magiskboot is ARM64 (for Android devices).
         # We need the x86_64 Linux version for the CI runner.
         echo "Downloading magiskboot for Linux x86_64..."
-        MAGISK_VER="v28.1"
-        wget -qO magiskboot.zip \
-          "https://github.com/nicholaschum/magiskboot_build/releases/download/${MAGISK_VER}/magiskboot-x86_64-linux-gnu.zip" \
-          2>/dev/null && {
-          unzip -o magiskboot.zip magiskboot 2>/dev/null
-          chmod +x magiskboot
-        } || {
-          # Fallback: try alternative magiskboot release
-          echo "Primary magiskboot source failed, trying alternative..."
-          wget -qO magiskboot \
-            "https://github.com/nicholaschum/magiskboot_build/releases/latest/download/magiskboot-x86_64-linux-gnu" \
-            2>/dev/null || {
-            # Last resort: try using the AnyKernel3 one (might work on some runners)
-            echo "WARNING: Falling back to AnyKernel3 magiskboot (may fail on x86_64)"
-            cp $GITHUB_WORKSPACE/anykernel/tools/magiskboot ./magiskboot
-          }
-          chmod +x magiskboot
-        }
+        wget -qO magiskboot \
+          "https://github.com/topjohnwu/Magisk/releases/latest/download/magiskboot" \
+          || cp $GITHUB_WORKSPACE/anykernel/tools/magiskboot ./magiskboot
+        chmod +x magiskboot
 
         # Verify magiskboot works
         ./magiskboot 2>&1 | head -3 || {
