@@ -697,7 +697,7 @@ jobs:
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
         # Suppress non-fatal DTC warnings from upstream yupik DTSI files.
-        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg -Wno-unique_unit_address"
+        export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg -Wno-unique_unit_address -Wno-avoid_unnecessary_addr_size -Wno-graph_child_address -Wno-unit_address_format"
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
