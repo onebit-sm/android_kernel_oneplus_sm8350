@@ -606,12 +606,23 @@ jobs:
           sed -i 's/^        /\t/' "$LEMON_REAL"
           sed -i '/^\t/! s/^    /\t/' "$LEMON_REAL"
 
-          # FIX: ensure dtb-y and dtbo-y are used (not CONFIG_ARCH_LAHAINA gated)
-          sed -i 's/dtb-\$(CONFIG_ARCH_LAHAINA) +=/dtb-y += \\/' "$LEMON_REAL"
+          # FIX: The Makefile relies on CONFIG_BUILD_ARM64_DT_OVERLAY=y to build dtbo overlays.
+          # If not set, it tries to build a monolithic lemonadep-overlay.dtb which doesn't exist.
+          # We force the Makefile to ALWAYS build the dtbos and strip the ifeq/else.
+          
+          # Delete the ifeq, else, and endif lines
+          sed -i '/ifeq ($(CONFIG_BUILD_ARM64_DT_OVERLAY),y)/d' "$LEMON_REAL"
+          sed -i '/^else/d' "$LEMON_REAL"
+          sed -i '/^endif/d' "$LEMON_REAL"
+          
+          # Delete the monolithic target that doesn't exist
+          sed -i '/lemonadep-overlay.dtb/d' "$LEMON_REAL"
+          
+          # Ensure dtbo-y is used (some Makefiles use dtbo-$(CONFIG_ARCH_LAHAINA))
           sed -i 's/dtbo-\$(CONFIG_ARCH_LAHAINA) +=/dtbo-y += \\/' "$LEMON_REAL"
 
-          echo "=== Lines 10-20 after fix ==="
-          sed -n '10,20p' "$LEMON_REAL" | cat -A
+          echo "=== Lines 1-20 after fix ==="
+          head -20 "$LEMON_REAL" | cat -A
           echo "=== Full Makefile (%% debug) ==="
           cat -An "$LEMON_REAL"
 
