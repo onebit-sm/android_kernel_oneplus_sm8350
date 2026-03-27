@@ -921,152 +921,81 @@ jobs:
         mkdir -p $WORK_DIR
         cd $WORK_DIR
 
-        # ── 1. Download stock vendor_boot from smualemi's repo ────────────
-        echo "Downloading stock vendor_boot (handling Git LFS)..."
-        GIT_LFS_SKIP_SMUDGE=0 git clone --depth=1 --filter=blob:none \
-          https://github.com/smualemi/op9pro-kernel-build.git $WORK_DIR/vboot_repo
-        cp $WORK_DIR/vboot_repo/stock_vendor_boot.zip .
-
-        if [ ! -f "stock_vendor_boot.zip" ] || [ $(stat -c%s stock_vendor_boot.zip) -lt 1024 ]; then
-          echo "FATAL: Failed to download stock_vendor_boot.zip or it is an LFS pointer."
+        # ── 1. Locate and extract stock vendor_boot.img ────────────
+        echo "Searching for stock_vendor_boot.zip in workspace..."
+        VBOOT_ZIP=$(find $GITHUB_WORKSPACE -name "vendor_boot.zip" | head -n 1)
+        if [ -z "$VBOOT_ZIP" ]; then
+          echo "FATAL: vendor_boot.zip not found in workspace!"
+          find $GITHUB_WORKSPACE -maxdepth 3
           exit 1
         fi
-        echo "Downloaded: $(du -h stock_vendor_boot.zip | cut -f1)"
-
-        # ── 2. Extract the .img from the zip ──────────────────────────────
+        echo "Found: $VBOOT_ZIP"
+        cp "$VBOOT_ZIP" stock_vendor_boot.zip
+        
         unzip -o stock_vendor_boot.zip
+        STOCK_IMG=$(find . -name "*.img" | head -n 1)
+        if [ -z "$STOCK_IMG" ]; then
+          echo "ERROR: No .img found in stock_vendor_boot.zip!"
+          exit 1
+        fi
+        if [ "$STOCK_IMG" != "./vendor_boot.img" ] && [ "$STOCK_IMG" != "vendor_boot.img" ]; then
+          mv "$STOCK_IMG" vendor_boot.img
+        fi
+        echo "Stock image: vendor_boot.img ($(du -h vendor_boot.img | cut -f1))"
+
+        # ── 2. Get Magisk v27.0 (Known Working) ────────────────────
+        echo "==> Fetching official magiskboot (v27.0) from Magisk APK..."
+        wget -qO magisk.apk https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+        unzip -j magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+        mv libmagiskboot.so magiskboot
+        chmod +x magiskboot
+
+        # ── 3. Unpack and extract ramdisk ─────────────────────────
+        echo "==> Unpacking vendor_boot.img..."
+        ./magiskboot unpack vendor_boot.img
         
-        # Auto-detect the extracted .img filename
-        STOCK_VENDOR_BOOT=$(find "$WORK_DIR" -maxdepth 1 -name "*.img" | head -1)
-        if [ -z "$STOCK_VENDOR_BOOT" ]; then
-          echo "FATAL: No .img found after extracting ZIP. Contents:"
-          ls -la "$WORK_DIR/"
-          unzip -l stock_vendor_boot.zip
+        # Magiskboot usually produces 'ramdisk.cpio' or 'vendor_ramdisk.cpio'
+        RAMDISK_CPIO=$(find . -maxdepth 1 -name "*ramdisk.cpio" | head -1)
+        if [ -z "$RAMDISK_CPIO" ]; then
+          echo "ERROR: magiskboot failed to extract ramdisk.cpio!"
+          ls -la
           exit 1
         fi
-        echo "Stock vendor_boot image: $STOCK_VENDOR_BOOT ($(du -h "$STOCK_VENDOR_BOOT" | cut -f1))"
-
-        # ── 3. Get magiskboot (x86_64 Linux binary) ──────────────────────
-        # AnyKernel3's tools/magiskboot is ARM64 (for Android devices).
-        # We extract the x86_64 Linux version directly from the official Magisk APK.
-        echo "Downloading magiskboot from official Magisk APK..."
-        LATEST_APK_URL=$(curl -sL https://api.github.com/repos/topjohnwu/Magisk/releases/latest | grep -oP '"browser_download_url": "\K(.*Magisk-v.*\.apk)(?=")' | head -1)
-        if [ -z "$LATEST_APK_URL" ]; then
-          echo "Rate limited or failed to get latest, using fallback URL..."
-          LATEST_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk"
-        fi
+        echo "Extracted ramdisk: $RAMDISK_CPIO"
         
-        wget -qO magisk.apk "$LATEST_APK_URL"
-        unzip -j magisk.apk lib/x86_64/libmagiskboot.so -d . || true
+        mkdir ramdisk_ext
+        cd ramdisk_ext
+        cpio -idm < ../$RAMDISK_CPIO
         
-        if [ -f "libmagiskboot.so" ]; then
-          mv libmagiskboot.so magiskboot
-          chmod +x magiskboot
-        else
-          echo "FATAL: Failed to extract libmagiskboot.so from downloaded APK"
-          exit 1
-        fi
-
-        # Verify magiskboot works
-        ./magiskboot 2>&1 | head -3 || {
-          echo "FATAL: magiskboot binary does not work on this platform"
-          file ./magiskboot
-          exit 1
-        }
-
-        # ── 4. Unpack vendor_boot ─────────────────────────────────────────
-        ./magiskboot unpack "$STOCK_VENDOR_BOOT"
-        echo "=== Unpacked files ==="
-        ls -la "$WORK_DIR/"
-
-        # ── 5. Extract the vendor ramdisk ─────────────────────────────────
-        mkdir -p ramdisk
-        if lz4 -d vendor_ramdisk vendor_ramdisk.cpio 2>/dev/null; then
-          echo "Ramdisk was lz4-compressed"
-        else
-          cp vendor_ramdisk vendor_ramdisk.cpio
-          echo "Ramdisk was uncompressed cpio"
-        fi
-
-        cd ramdisk
-        cpio -idm < ../vendor_ramdisk.cpio
-        echo "Ramdisk extracted"
-
-        # ── 6. Replace modules in ramdisk ─────────────────────────────────
-        MODULES_DIR=$(find . -name "modules.load" -exec dirname {} \; | head -1)
-        if [ -z "$MODULES_DIR" ]; then
-          echo "FATAL: modules.load not found inside vendor_boot ramdisk"
-          find . -maxdepth 5 -name "*.ko" | head -10
-          exit 1
-        fi
-        echo "Modules directory: $MODULES_DIR"
-        echo "=== modules.load contents ==="
-        cat "$MODULES_DIR/modules.load"
-        echo ""
-
-        NEEDED=$(cat "$MODULES_DIR/modules.load")
-        rm -f "$MODULES_DIR/"*.ko
-
+        # ── 4. Replace stock .ko modules with newly built ones ─────
+        echo "==> Replacing stock .ko modules with newly built ones..."
         PLACED=0
-        MISSING=0
-        for mod_path in $NEEDED; do
-          mod_name=$(basename "$mod_path")
-          KO_FILE=$(find "$GITHUB_WORKSPACE/kernel_source/out" -name "$mod_name" 2>/dev/null | head -1)
-          if [ -n "$KO_FILE" ]; then
-            cp "$KO_FILE" "$MODULES_DIR/"
-            echo "  PLACED: $mod_name"
-            PLACED=$((PLACED + 1))
-          else
-            echo "  WARN:   $mod_name NOT FOUND in custom build"
-            MISSING=$((MISSING + 1))
-          fi
+        for ko in $(find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" -type f); do
+            filename=$(basename $ko)
+            # Find the match inside the extracted ramdisk
+            target=$(find . -type f -name "$filename" | head -n 1)
+            if [ -n "$target" ]; then
+                cp "$ko" "$target"
+                echo "  [Updated] $filename -> $target"
+                PLACED=$((PLACED + 1))
+            fi
         done
-        echo ""
-        echo "Placed: $PLACED  |  Missing: $MISSING"
-
-        if [ "$MISSING" -gt 0 ]; then
-          echo "WARNING: $MISSING modules from modules.load not found in build output."
-          echo "These modules may need to be built as =y (built-in) or may not affect boot."
+        echo "Replaced $PLACED modules."
+        
+        # ── 5. Repack ramdisk and vendor_boot ─────────────────────
+        echo "==> Repacking ramdisk..."
+        find . | cpio -H newc -o > ../$RAMDISK_CPIO
+        cd ..
+        
+        echo "==> Repacking vendor_boot_custom.img..."
+        ./magiskboot repack vendor_boot.img vendor_boot_custom.img
+        
+        if [ ! -f "vendor_boot_custom.img" ]; then
+          echo "FATAL: Repack failed!"
+          exit 1
         fi
-
-        # ── 7. Regenerate module dependencies ─────────────────────────────
-        KVER=$(cat "$GITHUB_WORKSPACE/kernel_source/out/include/config/kernel.release" 2>/dev/null \
-          || strings "$GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image" \
-             | grep "Linux version" | head -1 | awk '{print $3}')
-        echo "Kernel version for depmod: $KVER"
-
-        cd "$WORK_DIR/ramdisk"
-        depmod -a -b . "$KVER" 2>/dev/null || echo "depmod warning (non-fatal)"
-
-        # ── 8. Repack ramdisk cpio ────────────────────────────────────────
-        cd "$WORK_DIR/ramdisk"
-        find . | cpio -H newc -o > ../vendor_ramdisk_new.cpio
-        echo "New ramdisk cpio: $(du -h ../vendor_ramdisk_new.cpio | cut -f1)"
-
-        if lz4 -l -12 ../vendor_ramdisk_new.cpio ../vendor_ramdisk_new 2>/dev/null; then
-          echo "Repacked with lz4 compression"
-        else
-          cp ../vendor_ramdisk_new.cpio ../vendor_ramdisk_new
-          echo "Repacked without compression"
-        fi
-
-        # ── 9. Replace ramdisk and optionally update DTB ──────────────────
-        cd "$WORK_DIR"
-        cp vendor_ramdisk_new vendor_ramdisk
-
-        DTB_NEW=$(find "$GITHUB_WORKSPACE/dtbs" -name "*.dtb" | head -1)
-        if [ -f "$DTB_NEW" ]; then
-          cp "$DTB_NEW" dtb
-          echo "Updated DTB inside vendor_boot: $DTB_NEW"
-        else
-          echo "WARNING: No DTB found — using stock DTB in vendor_boot"
-        fi
-
-        # ── 10. Repack vendor_boot.img ────────────────────────────────────
-        ./magiskboot repack "$STOCK_VENDOR_BOOT" vendor_boot_custom.img
-        echo "vendor_boot_custom.img: $(du -h vendor_boot_custom.img | cut -f1)"
-
-        cp vendor_boot_custom.img "$GITHUB_WORKSPACE/vendor_boot_custom.img"
+        
+        cp vendor_boot_custom.img $GITHUB_WORKSPACE/vendor_boot_custom.img
         echo "Final artifact ready: $GITHUB_WORKSPACE/vendor_boot_custom.img"
 
     # ══════════════════════════════════════════════════════════════════════════
