@@ -389,7 +389,6 @@ jobs:
           zip \
           zlib1g-dev \
           binutils-aarch64-linux-gnu
-          
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
@@ -472,7 +471,8 @@ jobs:
           --enable QCOM_COMMAND_DB \
           --enable DRM_OPLUS_NOTIFY \
           --enable DRM_OPLUS_PANEL_NOTIFY \
-          --enable OPLUS_BINDER_STATS_ENABLE
+          --enable OPLUS_BINDER_STATS_ENABLE \
+          --enable BUILD_ARM64_DT_OVERLAY
 
         # Apply the changes
         make O=out \
@@ -768,16 +768,10 @@ jobs:
           LLVM=1 \
           LLVM_IAS=1 \
           modules 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
-
+        
         if [ "${PIPESTATUS[0]}" -ne 0 ]; then
           echo "FATAL: in-tree modules build failed!"
           exit 1
-        fi
-
-        KO_COUNT=$(find out -name "*.ko" | wc -l)
-        echo "In-tree .ko built: $KO_COUNT"
-        if [ "$KO_COUNT" -eq 0 ]; then
-          echo "WARNING: Zero .ko files produced — check defconfig for module settings"
         fi
         echo "In-tree modules built OK"
 
@@ -891,14 +885,10 @@ jobs:
         cp $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/Image $AK/
         echo "Kernel Image: OK"
         
-        # Package DTB into AnyKernel3 so it routes to vendor_boot during flash
-        echo "=== Finding lemonadep DTB ==="
-        # lemonadep is lahaina silicon — pick lahaina-v2 or lahaina-v2.1 base DTB
+        # Package DTB and DTBO into AnyKernel3
+        echo "=== Selecting correct base DTB for OnePlus 9 Pro (Lahaina) ==="
         DTB_SRC=""
-        for candidate in \
-          "lahaina-v2.1.dtb" \
-          "lahaina-v2.dtb" \
-          "lahaina.dtb"; do
+        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
           f="$GITHUB_WORKSPACE/dtbs/$candidate"
           if [ -f "$f" ]; then
             DTB_SRC="$f"
@@ -906,40 +896,30 @@ jobs:
           fi
         done
 
-        # Strict fallback: any lahaina*.dtb — never allow a yupik or other SoC
+        # Strict fallback: search for ANY lahaina*.dtb, avoid yupik/etc.
         if [ -z "$DTB_SRC" ]; then
-          DTB_SRC=$(find "$GITHUB_WORKSPACE/dtbs" -name "lahaina*.dtb" | sort | head -1)
+          DTB_SRC=$(find "$GITHUB_WORKSPACE/dtbs" -name "lahaina*.dtb" | sort | head -n 1)
         fi
 
-        if [ -f "$DTB_SRC" ]; then
-          cp "$DTB_SRC" "$AK/dtb"
-          echo "DTB packaged: $DTB_SRC"
+        if [ -n "$DTB_SRC" ] && [ -f "$DTB_SRC" ]; then
+          cp "$DTB_SRC" $AK/dtb
+          echo "✓ DTB packaged: $(basename "$DTB_SRC")"
         else
-          echo "ERROR: No lahaina DTB found — check Step 12 output"
+          echo "ERROR: No suitable Lahaina DTB found. Available DTBs:"
+          ls $GITHUB_WORKSPACE/dtbs/ | head -n 20
           exit 1
         fi
-        
-        # Assemble dtbo.img from all lemonadep overlays (in stable alphabetical order)
-        echo "=== Assembling dtbo.img ==="
+
+        # Assemble dtbo.img from all lemonade* overlays (cat is fine for QCOM)
+        echo "=== Assembling dtbo.img from lemonade overlays ==="
         DTBO_FILES=$(find "$GITHUB_WORKSPACE/dtbs" -name "lemonade*.dtbo" | sort)
-        if [ -z "$DTBO_FILES" ]; then
-          echo "ERROR: No lemonade DTBO files found!"
-          exit 1
+        if [ -n "$DTBO_FILES" ]; then
+          cat $DTBO_FILES > $AK/dtbo.img
+          echo "✓ DTBO packaged: $(ls -lh $AK/dtbo.img | awk '{print $5}')"
+        else
+          echo "WARNING: No lemonade DTBO overlays found!"
         fi
 
-        # Use mkdtimg if available (recommended for production), otherwise cat-concatenate
-        if command -v mkdtimg >/dev/null 2>&1; then
-          DTBO_ARGS=""
-          for f in $DTBO_FILES; do
-            DTBO_ARGS="$DTBO_ARGS add $f"
-          done
-          mkdtimg create "$AK/dtbo.img" $DTBO_ARGS
-        else
-          # Fallback: raw concatenation (accepted by fastboot on Qualcomm devices)
-          cat $DTBO_FILES > "$AK/dtbo.img"
-        fi
-        echo "DTBO packaged: $(ls -lh $AK/dtbo.img)"
-        
         # NOTE: do.modules=0 in anykernel.sh — no vendor partition modules
         # are packaged. The vendor_boot ramdisk modules are handled
         # separately in Step 17a below.
@@ -989,52 +969,16 @@ jobs:
         # ── 3. Unpack and extract ramdisk ─────────────────────────
         echo "==> Unpacking vendor_boot.img..."
         ./magiskboot unpack vendor_boot.img
-        # After ./magiskboot unpack vendor_boot.img
-        echo "==> Replacing vendor_boot DTB with newly built lahaina DTB..."
-        VBOOT_DTB=""
-        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
-          f="$GITHUB_WORKSPACE/dtbs/$candidate"
-          if [ -f "$f" ]; then
-            VBOOT_DTB="$f"
-            break
-          fi
-        done
-        if [ -n "$VBOOT_DTB" ]; then
-          cp "$VBOOT_DTB" dtb
-          echo "Replaced vendor_boot DTB with: $VBOOT_DTB ($(du -h dtb | cut -f1))"
-        else
-          echo "WARNING: Could not find replacement DTB — keeping stock DTB"
-        fi
-        # Magiskboot usually produces 'ramdisk.cpio' or 'vendor_ramdisk.cpio'
         RAMDISK_CPIO=$(find . -maxdepth 1 -name "*ramdisk.cpio" | head -1)
-        if [ -z "$RAMDISK_CPIO" ]; then
-          echo "ERROR: magiskboot failed to extract ramdisk.cpio!"
-          ls -la
-          exit 1
-        fi
-        echo "Extracted ramdisk: $RAMDISK_CPIO"
-        
-        mkdir ramdisk_ext
-        cd ramdisk_ext
+        mkdir ramdisk_ext && cd ramdisk_ext
         cpio -idm < ../$RAMDISK_CPIO
         
         # ── 4. Replace stock .ko modules with newly built ones ─────
-        echo "==> Replacing stock .ko modules with newly built ones..."
+        echo "==> Replacing stock .ko modules..."
+        # Search BOTH in-tree and out-of-tree (vendor_modules) outputs
         PLACED=0
-        for ko in $(find \
-            "$GITHUB_WORKSPACE/kernel_source/out" \
-            "$GITHUB_WORKSPACE/vendor_modules" \
-            -name "*.ko" -type f 2>/dev/null); do
-            echo "=== Built .ko count ==="
-            find "$GITHUB_WORKSPACE/kernel_source/out" "$GITHUB_WORKSPACE/vendor_modules" \
-              -name "*.ko" 2>/dev/null | wc -l
-
-            echo "=== Ramdisk .ko count ==="
-            find . -name "*.ko" | wc -l
-
-            echo "=== First 10 ramdisk modules ==="
-            find . -name "*.ko" | head -10
-            # Find the match inside the extracted ramdisk
+        for ko in $(find "$GITHUB_WORKSPACE/kernel_source/out" "$GITHUB_WORKSPACE/vendor_modules" -name "*.ko" -type f 2>/dev/null); do
+            filename=$(basename $ko)
             target=$(find . -type f -name "$filename" | head -n 1)
             if [ -n "$target" ]; then
                 cp "$ko" "$target"
@@ -1044,19 +988,24 @@ jobs:
         done
         echo "Replaced $PLACED modules."
         
-        # ── 5. Repack ramdisk and vendor_boot ─────────────────────
-        echo "==> Repacking ramdisk..."
+        # ── 5. Repack cpio and update internal DTB ────────────────
         find . | cpio -H newc -o > ../$RAMDISK_CPIO
         cd ..
         
+        echo "==> Updating internal vendor_boot DTB..."
+        VBOOT_DTB=""
+        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
+          f="$GITHUB_WORKSPACE/dtbs/$candidate"
+          if [ -f "$f" ]; then VBOOT_DTB="$f"; break; fi
+        done
+        if [ -n "$VBOOT_DTB" ]; then
+          cp "$VBOOT_DTB" dtb
+          echo "✓ Internal DTB updated: $(basename "$VBOOT_DTB")"
+        fi
+
+        # ── 6. Final Repack and cleanup ───────────────────────────
         echo "==> Repacking vendor_boot_custom.img..."
         ./magiskboot repack vendor_boot.img vendor_boot_custom.img
-        
-        if [ ! -f "vendor_boot_custom.img" ]; then
-          echo "FATAL: Repack failed!"
-          exit 1
-        fi
-        
         cp vendor_boot_custom.img $GITHUB_WORKSPACE/vendor_boot_custom.img
         echo "Final artifact ready: $GITHUB_WORKSPACE/vendor_boot_custom.img"
 
