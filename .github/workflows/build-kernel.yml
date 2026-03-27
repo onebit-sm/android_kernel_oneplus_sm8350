@@ -885,22 +885,22 @@ jobs:
         echo "Kernel Image: OK"
         
         # Package DTB into AnyKernel3 so it routes to vendor_boot during flash
-        echo "=== Finding lemonadep DTB ==="
-        DTB_SRC=$(find $GITHUB_WORKSPACE/kernel_source/out/arch/arm64/boot/dts \
-          \( -name "lahaina-v2-v2.dtb" \
-          -o -name "*lemonadep*.dtb" \
-          -o -name "lahaina_sku3.dtb" \) \
-          2>/dev/null | head -1)
-          
-        if [ -z "$DTB_SRC" ]; then
-          DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*.dtb" | head -1)
-        fi
+        echo "=== Selecting correct DTB for OnePlus 9 Pro ==="
+        # Search priority: 
+        # 1. lemonadep (9 Pro specific)
+        # 2. lemonade (9 series generic)
+        # 3. lahaina-v2-v2 (the SD888 base for this device)
+        DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*lemonadep*.dtb" 2>/dev/null | head -n 1)
+        [ -z "$DTB_SRC" ] && DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*lemonade*.dtb" 2>/dev/null | head -n 1)
+        [ -z "$DTB_SRC" ] && DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "lahaina-v2-v2.dtb" 2>/dev/null | head -n 1)
         
-        if [ -f "$DTB_SRC" ]; then
+        if [ -n "$DTB_SRC" ] && [ -f "$DTB_SRC" ]; then
           cp "$DTB_SRC" $AK/dtb
-          echo "DTB packaged: $DTB_SRC"
+          echo "✓ DTB packaged: $(basename "$DTB_SRC")"
         else
-          echo "ERROR: No DTB found — vendor_boot will not be updated"
+          echo "ERROR: Failed to find a suitable DTB for lemonade/p."
+          echo "Contents of dtbs directory:"
+          ls $GITHUB_WORKSPACE/dtbs/ | head -n 20
           exit 1
         fi
 
