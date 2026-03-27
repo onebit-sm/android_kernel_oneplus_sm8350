@@ -103,11 +103,12 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     - name: Pin kernel version string to match stock
       run: |
-        echo "-gd2a1055adeb0" > $GITHUB_WORKSPACE/kernel_source/.scmversion
-
-        echo "Pinned .scmversion: $(cat $GITHUB_WORKSPACE/kernel_source/.scmversion)"
-        echo "Expected final kernel version: 5.4.254-qgki-gd2a1055adeb0"
-
+        # Empty .scmversion → setlocalversion returns "" immediately,
+        # suppressing both the git hash AND the dirty-tree +
+        # CONFIG_LOCALVERSION (Step 9) will carry the full suffix.
+        printf '' > $GITHUB_WORKSPACE/kernel_source/.scmversion
+        echo "Pinned .scmversion: (empty — suppresses git dirty marker)"
+        
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 4 — Symlink all techpack directories from vendor_modules
     # ══════════════════════════════════════════════════════════════════════════
@@ -462,6 +463,7 @@ jobs:
           vendor/lahaina-qgki_defconfig
 
         scripts/config --file out/.config \
+          --set-str LOCALVERSION "-qgki-gd2a1055adeb0" \
           --disable LOCALVERSION_AUTO \
           --disable MODVERSIONS \
           --disable MODULE_SIG_FORCE \
@@ -484,6 +486,7 @@ jobs:
         # Verify critical config values
         echo "=== Config verification ==="
         grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER" out/.config || true
+        grep "CONFIG_LOCALVERSION" out/.config
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9b — Inject display-notifier stubs for vmlinux linkage
@@ -701,23 +704,20 @@ jobs:
     - name: Verify kernel version matches stock
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
-        IMG="out/arch/arm64/boot/Image"
-        VERSION=$(strings "$IMG" | grep "Linux version" | head -1)
-        echo "Built kernel version: $VERSION"
-
-        # Also check kernel.release if available
-        if [ -f "out/include/config/kernel.release" ]; then
-          echo "kernel.release: $(cat out/include/config/kernel.release)"
-        fi
-
-        if echo "$VERSION" | grep -q "5.4.254-qgki-gd2a1055adeb0"; then
+        # kernel.release is the authoritative source — never use strings()
+        # on the Image binary; it finds printf format strings first.
+        RELEASE=$(cat out/include/config/kernel.release 2>/dev/null || echo "NOT FOUND")
+        echo "kernel.release: $RELEASE"
+    
+        if echo "$RELEASE" | grep -qF "5.4.254-qgki-gd2a1055adeb0"; then
           echo "✓ Version string matches stock — vermagic will match"
         else
           echo "⚠ WARNING: Version string does NOT match stock exactly"
-          echo "  Expected substring: 5.4.254-qgki-gd2a1055adeb0"
-          echo "  Got: $VERSION"
-          echo "  This may cause module loading issues."
-          echo "  Continuing build, but verify .scmversion and LOCALVERSION_AUTO settings."
+          echo "  Expected: 5.4.254-qgki-gd2a1055adeb0"
+          echo "  Got:      $RELEASE"
+          echo "  Check: CONFIG_LOCALVERSION in out/.config"
+          grep "CONFIG_LOCALVERSION" out/.config || true
+          exit 1   # fail hard — a wrong vermagic will always bootloop
         fi
 
     # ══════════════════════════════════════════════════════════════════════════
