@@ -389,6 +389,7 @@ jobs:
           zip \
           zlib1g-dev \
           binutils-aarch64-linux-gnu
+          
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
@@ -759,18 +760,24 @@ jobs:
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        make -j2 O=out \
+        make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
           CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
-          modules >> $GITHUB_WORKSPACE/build.log 2>&1
+          modules 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
 
-        if [ $? -ne 0 ]; then
+        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
           echo "FATAL: in-tree modules build failed!"
           exit 1
+        fi
+
+        KO_COUNT=$(find out -name "*.ko" | wc -l)
+        echo "In-tree .ko built: $KO_COUNT"
+        if [ "$KO_COUNT" -eq 0 ]; then
+          echo "WARNING: Zero .ko files produced — check defconfig for module settings"
         fi
         echo "In-tree modules built OK"
 
@@ -885,25 +892,54 @@ jobs:
         echo "Kernel Image: OK"
         
         # Package DTB into AnyKernel3 so it routes to vendor_boot during flash
-        echo "=== Selecting correct DTB for OnePlus 9 Pro ==="
-        # Search priority: 
-        # 1. lemonadep (9 Pro specific)
-        # 2. lemonade (9 series generic)
-        # 3. lahaina-v2-v2 (the SD888 base for this device)
-        DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*lemonadep*.dtb" 2>/dev/null | head -n 1)
-        [ -z "$DTB_SRC" ] && DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "*lemonade*.dtb" 2>/dev/null | head -n 1)
-        [ -z "$DTB_SRC" ] && DTB_SRC=$(find $GITHUB_WORKSPACE/dtbs -name "lahaina-v2-v2.dtb" 2>/dev/null | head -n 1)
-        
-        if [ -n "$DTB_SRC" ] && [ -f "$DTB_SRC" ]; then
-          cp "$DTB_SRC" $AK/dtb
-          echo "✓ DTB packaged: $(basename "$DTB_SRC")"
+        echo "=== Finding lemonadep DTB ==="
+        # lemonadep is lahaina silicon — pick lahaina-v2 or lahaina-v2.1 base DTB
+        DTB_SRC=""
+        for candidate in \
+          "lahaina-v2.1.dtb" \
+          "lahaina-v2.dtb" \
+          "lahaina.dtb"; do
+          f="$GITHUB_WORKSPACE/dtbs/$candidate"
+          if [ -f "$f" ]; then
+            DTB_SRC="$f"
+            break
+          fi
+        done
+
+        # Strict fallback: any lahaina*.dtb — never allow a yupik or other SoC
+        if [ -z "$DTB_SRC" ]; then
+          DTB_SRC=$(find "$GITHUB_WORKSPACE/dtbs" -name "lahaina*.dtb" | sort | head -1)
+        fi
+
+        if [ -f "$DTB_SRC" ]; then
+          cp "$DTB_SRC" "$AK/dtb"
+          echo "DTB packaged: $DTB_SRC"
         else
-          echo "ERROR: Failed to find a suitable DTB for lemonade/p."
-          echo "Contents of dtbs directory:"
-          ls $GITHUB_WORKSPACE/dtbs/ | head -n 20
+          echo "ERROR: No lahaina DTB found — check Step 12 output"
+          exit 1
+        fi
+        
+        # Assemble dtbo.img from all lemonadep overlays (in stable alphabetical order)
+        echo "=== Assembling dtbo.img ==="
+        DTBO_FILES=$(find "$GITHUB_WORKSPACE/dtbs" -name "lemonade*.dtbo" | sort)
+        if [ -z "$DTBO_FILES" ]; then
+          echo "ERROR: No lemonade DTBO files found!"
           exit 1
         fi
 
+        # Use mkdtimg if available (recommended for production), otherwise cat-concatenate
+        if command -v mkdtimg >/dev/null 2>&1; then
+          DTBO_ARGS=""
+          for f in $DTBO_FILES; do
+            DTBO_ARGS="$DTBO_ARGS add $f"
+          done
+          mkdtimg create "$AK/dtbo.img" $DTBO_ARGS
+        else
+          # Fallback: raw concatenation (accepted by fastboot on Qualcomm devices)
+          cat $DTBO_FILES > "$AK/dtbo.img"
+        fi
+        echo "DTBO packaged: $(ls -lh $AK/dtbo.img)"
+        
         # NOTE: do.modules=0 in anykernel.sh — no vendor partition modules
         # are packaged. The vendor_boot ramdisk modules are handled
         # separately in Step 17a below.
@@ -953,7 +989,22 @@ jobs:
         # ── 3. Unpack and extract ramdisk ─────────────────────────
         echo "==> Unpacking vendor_boot.img..."
         ./magiskboot unpack vendor_boot.img
-        
+        # After ./magiskboot unpack vendor_boot.img
+        echo "==> Replacing vendor_boot DTB with newly built lahaina DTB..."
+        VBOOT_DTB=""
+        for candidate in "lahaina-v2.1.dtb" "lahaina-v2.dtb" "lahaina.dtb"; do
+          f="$GITHUB_WORKSPACE/dtbs/$candidate"
+          if [ -f "$f" ]; then
+            VBOOT_DTB="$f"
+            break
+          fi
+        done
+        if [ -n "$VBOOT_DTB" ]; then
+          cp "$VBOOT_DTB" dtb
+          echo "Replaced vendor_boot DTB with: $VBOOT_DTB ($(du -h dtb | cut -f1))"
+        else
+          echo "WARNING: Could not find replacement DTB — keeping stock DTB"
+        fi
         # Magiskboot usually produces 'ramdisk.cpio' or 'vendor_ramdisk.cpio'
         RAMDISK_CPIO=$(find . -maxdepth 1 -name "*ramdisk.cpio" | head -1)
         if [ -z "$RAMDISK_CPIO" ]; then
@@ -970,8 +1021,19 @@ jobs:
         # ── 4. Replace stock .ko modules with newly built ones ─────
         echo "==> Replacing stock .ko modules with newly built ones..."
         PLACED=0
-        for ko in $(find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" -type f); do
-            filename=$(basename $ko)
+        for ko in $(find \
+            "$GITHUB_WORKSPACE/kernel_source/out" \
+            "$GITHUB_WORKSPACE/vendor_modules" \
+            -name "*.ko" -type f 2>/dev/null); do
+            echo "=== Built .ko count ==="
+            find "$GITHUB_WORKSPACE/kernel_source/out" "$GITHUB_WORKSPACE/vendor_modules" \
+              -name "*.ko" 2>/dev/null | wc -l
+
+            echo "=== Ramdisk .ko count ==="
+            find . -name "*.ko" | wc -l
+
+            echo "=== First 10 ramdisk modules ==="
+            find . -name "*.ko" | head -10
             # Find the match inside the extracted ramdisk
             target=$(find . -type f -name "$filename" | head -n 1)
             if [ -n "$target" ]; then
