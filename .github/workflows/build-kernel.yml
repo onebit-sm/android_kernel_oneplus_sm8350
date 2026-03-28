@@ -309,7 +309,7 @@ jobs:
         while IFS= read -r link; do
           [ -e "$link" ] && continue
           raw_target=$(readlink "$link")
-          clean=$(echo "$raw_target" | sed 's|^\(\.\./\)*||')
+          clean=$(echo "$raw_target" | sed 's|^\(\.\.*/\)*||')
           for candidate in \
             "$GITHUB_WORKSPACE/vendor_modules/$clean" \
             "$GITHUB_WORKSPACE/vendor_modules/vendor/$(echo "$clean" | sed 's|^vendor/||')" \
@@ -419,52 +419,82 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9 — Generate .config from defconfig
-    # ══════════════════════════════════════════════════════════════════════════
-    # CRITICAL FIX (from another_repo working build):
-    #   - MODVERSIONS must be disabled AFTER olddefconfig, not before
-    #   - Using POST_DEFCONFIG_CMDS approach ensures it stays disabled
-    #   - CROSS_COMPILE uses Android toolchain (aarch64-linux-android-)
+    #
+    # ROOT CAUSE FIX: The previous script had a bare `make O=out olddefconfig`
+    # at the end of this step WITHOUT ARCH=arm64 or any cross-compilation args.
+    # Without ARCH=arm64, make runs olddefconfig for the HOST architecture
+    # (x86_64), which completely corrupts the arm64 .config. When step 11 then
+    # runs `make ARCH=arm64 Image`, the kernel build system detects the .config
+    # is stale/wrong for arm64 and triggers an INTERACTIVE "Restart config"
+    # session. With stdin redirected, every new symbol defaults to 'n', cascading
+    # into compile failures (EROFS/EXT4 magic undefined, cpufreq identifiers
+    # missing, struct members absent, etc.).
+    #
+    # FIX: use a shared KBUILD_ARGS array applied identically to EVERY make call.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Generate .config from defconfig
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
-        
-        make O=out \
-          ARCH=arm64 \
-          CC=clang \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          LLVM=1 \
-          LLVM_IAS=1 \
-          vendor/lahaina-qgki_defconfig
 
+        # All make calls in this step MUST use these exact same arguments.
+        # Omitting any one of them from olddefconfig corrupts the .config.
+        KBUILD_ARGS=(
+          O=out
+          ARCH=arm64
+          CC=clang
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          CROSS_COMPILE=aarch64-linux-android-
+          CROSS_COMPILE_COMPAT=arm-linux-androideabi-
+          LLVM=1
+          LLVM_IAS=1
+        )
+
+        # 1. Generate base .config from the OnePlus 9 Pro QGKI defconfig
+        make "${KBUILD_ARGS[@]}" vendor/lahaina-qgki_defconfig
+
+        # 2. Pin the version string to match stock
         scripts/config --file out/.config \
           --set-str LOCALVERSION "-qgki-gd2a1055adeb0" \
-          --disable LOCALVERSION_AUTO \
+          --disable LOCALVERSION_AUTO
+
+        # 3. Resolve all dependencies after LOCALVERSION change
+        make "${KBUILD_ARGS[@]}" olddefconfig
+
+        # 4. Apply custom overrides:
+        #    - MODVERSIONS=n: so all rebuilt .ko files have matching vermagic
+        #      (requires all stock vendor modules to be replaced via TWRP ZIP)
+        #    - MODULE_SIG=n: not needed for this build
+        scripts/config --file out/.config \
           --disable MODVERSIONS \
-          --disable MODULE_SIG_FORCE \
-          --disable MODULE_SIG_ALL \
-          --enable QCOM_COMMAND_DB \
-          --enable DRM_OPLUS_NOTIFY \
-          --enable DRM_OPLUS_PANEL_NOTIFY \
-          --enable OPLUS_BINDER_STATS_ENABLE \
-          --enable BUILD_ARM64_DT_OVERLAY
+          --disable MODULE_SIG \
+          --disable MODULE_SIG_ALL
 
-        # Apply the changes
-        make O=out \
-          ARCH=arm64 \
-          CC=clang \
-          CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-gnu- \
-          LLVM=1 \
-          LLVM_IAS=1 \
-          olddefconfig
+        # 5. Re-resolve with ARCH=arm64 — THIS IS THE CRITICAL STEP.
+        #    Using the KBUILD_ARGS array ensures ARCH=arm64 is never dropped.
+        make "${KBUILD_ARGS[@]}" olddefconfig
 
-        # Verify critical config values
+        # 6. Touch .config to mark it as up-to-date and prevent the kernel
+        #    build system from triggering an interactive "Restart config" in
+        #    the next step. This is a safety guard for timestamp-based checks.
+        touch out/.config
+
+        # 7. Verify the config is sane
         echo "=== Config verification ==="
-        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER" out/.config || true
+        echo "Kernel version string:"
         grep "CONFIG_LOCALVERSION" out/.config
+
+        echo ""
+        echo "MODVERSIONS (must NOT be set):"
+        grep "CONFIG_MODVERSIONS" out/.config || echo "  CONFIG_MODVERSIONS is not set ✓"
+
+        echo ""
+        echo "MODULE_SIG (must NOT be set):"
+        grep "^CONFIG_MODULE_SIG=" out/.config || echo "  CONFIG_MODULE_SIG is not set ✓"
+
+        echo ""
+        echo "SCHEDUTIL (must be set for UAG driver):"
+        grep "CONFIG_CPU_FREQ_GOV_SCHEDUTIL" out/.config || echo "  WARNING: SCHEDUTIL not found in config"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 9b — Inject display-notifier stubs for vmlinux linkage
@@ -529,9 +559,8 @@ jobs:
         echo "=== drivers/Makefile tail (verify hook) ==="
         tail -5 drivers/Makefile
 
-
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9c — Fix fingerprint driver include path (from original script)
+    # STEP 9c — Fix fingerprint driver include path
     # ══════════════════════════════════════════════════════════════════════════
     - name: Fix fingerprint driver include path
       run: |
@@ -556,6 +585,92 @@ jobs:
           echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
         fi
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 9d — Patch source files with known compilation issues
+    #
+    # FIX 1: mm/cont_pte_hugepage.c references EROFS_SUPER_MAGIC_V1 and
+    #         EXT4_SUPER_MAGIC, which are defined in <linux/magic.h>.
+    #         The file does not include this header, causing build failure
+    #         whenever CONFIG_CONT_PTE_HUGEPAGE=y (which is the defconfig default).
+    #         This is a bug in the Oplus kernel source. Fix: inject the include.
+    #
+    # FIX 2: kernel/uad/cpufreq_uag_main.c references cpufreq_idle_cpu_lock,
+    #         which is declared in <linux/cpufreq.h> only when
+    #         CONFIG_CPU_FREQ_GOV_SCHEDUTIL=y. If the header is not transitively
+    #         included, the identifier is undeclared. Fix: inject the include.
+    # ══════════════════════════════════════════════════════════════════════════
+    - name: Patch source files for compilation compatibility
+      working-directory: ${{ github.workspace }}/kernel_source
+      run: |
+        echo "=== Patch 1: mm/cont_pte_hugepage.c — add <linux/magic.h> ==="
+        HUGEPAGE_C="mm/cont_pte_hugepage.c"
+        if [ -f "$HUGEPAGE_C" ]; then
+          if grep -q "EROFS_SUPER_MAGIC_V1\|EXT4_SUPER_MAGIC" "$HUGEPAGE_C"; then
+            if ! grep -q "linux/magic.h" "$HUGEPAGE_C"; then
+              # Insert after the last existing #include line
+              LAST_INCLUDE=$(grep -n "^#include" "$HUGEPAGE_C" | tail -1 | cut -d: -f1)
+              if [ -n "$LAST_INCLUDE" ]; then
+                sed -i "${LAST_INCLUDE}a #include <linux/magic.h>" "$HUGEPAGE_C"
+              else
+                sed -i '1s/^/#include <linux\/magic.h>\n/' "$HUGEPAGE_C"
+              fi
+              echo "  PATCHED: inserted #include <linux/magic.h> into $HUGEPAGE_C"
+            else
+              echo "  OK: $HUGEPAGE_C already includes linux/magic.h"
+            fi
+          else
+            echo "  SKIP: $HUGEPAGE_C does not reference EROFS/EXT4 magic constants"
+          fi
+        else
+          echo "  SKIP: $HUGEPAGE_C not found (CONT_PTE_HUGEPAGE may be absent from this tree)"
+        fi
+
+        echo ""
+        echo "=== Patch 2: kernel/uad/cpufreq_uag_main.c — ensure cpufreq.h included ==="
+        UAG_C="kernel/uad/cpufreq_uag_main.c"
+        if [ -f "$UAG_C" ]; then
+          if grep -q "cpufreq_idle_cpu_lock" "$UAG_C"; then
+            if ! grep -q "linux/cpufreq.h" "$UAG_C"; then
+              LAST_INCLUDE=$(grep -n "^#include" "$UAG_C" | tail -1 | cut -d: -f1)
+              if [ -n "$LAST_INCLUDE" ]; then
+                sed -i "${LAST_INCLUDE}a #include <linux/cpufreq.h>" "$UAG_C"
+              else
+                sed -i '1s/^/#include <linux\/cpufreq.h>\n/' "$UAG_C"
+              fi
+              echo "  PATCHED: inserted #include <linux/cpufreq.h> into $UAG_C"
+            else
+              echo "  OK: $UAG_C already includes linux/cpufreq.h"
+            fi
+          else
+            echo "  SKIP: $UAG_C does not reference cpufreq_idle_cpu_lock"
+          fi
+
+          # Also check for prev_frame_loading struct member mismatch.
+          # If the member is used unconditionally but defined under a guard,
+          # ensure the guard config is enabled or add the member to the struct.
+          if grep -q "prev_frame_loading" "$UAG_C"; then
+            UAG_H="kernel/uad/cpufreq_uag.h"
+            if [ -f "$UAG_H" ] && ! grep -q "prev_frame_loading" "$UAG_H"; then
+              echo "  WARNING: prev_frame_loading used in $UAG_C but not found in $UAG_H"
+              echo "  Attempting to add member to struct uag_gov_cpu..."
+              # Add the member after the struct uag_gov_cpu opening brace
+              if grep -q "struct uag_gov_cpu" "$UAG_H"; then
+                sed -i '/struct uag_gov_cpu {/{
+                  n
+                  /prev_frame_loading/!s/\(.*\)/\tunsigned long prev_frame_loading;\n\1/
+                }' "$UAG_H" || true
+                echo "  Applied struct patch to $UAG_H"
+              fi
+            else
+              echo "  OK: prev_frame_loading present in $UAG_H (or header not found)"
+            fi
+          fi
+        else
+          echo "  SKIP: $UAG_C not found"
+        fi
+
+        echo ""
+        echo "Source patches complete"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 10 — Fix vendor DTB Makefile indentation
@@ -601,35 +716,44 @@ jobs:
         echo "Makefile CRLF fix complete"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10b — Remove -Werror from Makefiles
+    # STEP 10b — Remove -Werror from Makefiles (including symlinked techpack)
     # ══════════════════════════════════════════════════════════════════════════
     - name: Remove -Werror to allow warnings
       run: |
-        echo "=== Stripping -Werror from all Makefiles ==="
-        find $GITHUB_WORKSPACE/kernel_source -type f \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
+        echo "=== Stripping -Werror from all Makefiles (including symlinked dirs) ==="
+        # Use -L to follow symlinks into techpack/ and other linked dirs
+        find -L $GITHUB_WORKSPACE/kernel_source -type f \
+          \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
           -exec sed -i 's/-Werror[a-zA-Z0-9_=-]*//g' {} +
-        find $GITHUB_WORKSPACE/kernel_source -type f \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
+        find -L $GITHUB_WORKSPACE/kernel_source -type f \
+          \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
           -exec sed -i 's/-fmerge-constants//g' {} +
         echo "Done"
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 10c — Remove .git directories to prevent dirty tree
+    # STEP 10c — Remove .git directories to prevent dirty tree suffix
     # ══════════════════════════════════════════════════════════════════════════
     - name: Remove git directories to prevent dirty tree suffix
       run: |
         echo "=== Removing .git directories to prevent -dirty suffix ==="
-        find $GITHUB_WORKSPACE/kernel_source -name ".git" -exec rm -rf {} +
-        find $GITHUB_WORKSPACE/vendor_modules -name ".git" -exec rm -rf {} +
-        echo "" > $GITHUB_WORKSPACE/kernel_source/.scmversion
+        find $GITHUB_WORKSPACE/kernel_source -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+        find $GITHUB_WORKSPACE/vendor_modules -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+        # Re-assert empty .scmversion after .git removal
+        printf '' > $GITHUB_WORKSPACE/kernel_source/.scmversion
         echo "Done"
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 11 — Build kernel Image
+    #
+    # NOTE: Output now uses `tee` so errors appear in the GitHub Actions log
+    # in real time AND are saved to build.log for the upload artifact.
+    # PIPESTATUS[0] captures the make exit code despite the pipe.
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build kernel Image
       working-directory: ${{ github.workspace }}/kernel_source
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
+
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -638,20 +762,18 @@ jobs:
           CROSS_COMPILE_COMPAT=arm-linux-androideabi- \
           LLVM=1 \
           LLVM_IAS=1 \
-          Image > $GITHUB_WORKSPACE/build.log 2>&1
-        tail -20 $GITHUB_WORKSPACE/build.log || true
+          Image 2>&1 | tee $GITHUB_WORKSPACE/build.log
+        BUILD_RC=${PIPESTATUS[0]}
 
-        if [ ! -f out/arch/arm64/boot/Image ]; then
+        if [ "$BUILD_RC" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
           echo ""
-          echo "══════════ BUILD FAILED ══════════"
-          echo "--- Linker / compiler errors ---"
-          grep -E "ld\.lld: error:|fatal error:|error:|No such file or directory|Stop\." \
-            $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -60 || true
-          echo ""
-          echo "--- Last 60 lines of build.log ---"
-          tail -60 $GITHUB_WORKSPACE/build.log
+          echo "══════════ BUILD FAILED (exit $BUILD_RC) ══════════"
+          echo "--- Compiler / linker errors ---"
+          grep -E "error:|undefined reference|ld\.lld: error|No such file or directory|Stop\." \
+            $GITHUB_WORKSPACE/build.log | grep -v "^--$" | tail -80 || true
           exit 1
         fi
+
         echo "=== Kernel Image built ==="
         du -h out/arch/arm64/boot/Image
 
@@ -683,6 +805,7 @@ jobs:
       run: |
         export PATH="$CLANG_BIN_DIR:$PATH"
         export DTC_FLAGS="-Wno-gpios_property -Wno-graph_port -Wno-unit_address_vs_reg -Wno-pci_device_reg -Wno-pci_device_bus_num -Wno-simple_bus_reg -Wno-unique_unit_address -Wno-avoid_unnecessary_addr_size -Wno-graph_child_address -Wno-unit_address_format"
+
         make -j$(nproc --all) O=out \
           ARCH=arm64 \
           CC=clang \
@@ -692,8 +815,9 @@ jobs:
           LLVM_IAS=1 \
           DTC_FLAGS="$DTC_FLAGS" \
           dtbs 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
+        DTB_RC=${PIPESTATUS[0]}
 
-        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        if [ "$DTB_RC" -ne 0 ]; then
           echo "WARNING: DTB build had errors — checking if lemonade DTBs were built..."
         fi
 
@@ -722,13 +846,13 @@ jobs:
           LLVM=1 \
           LLVM_IAS=1 \
           modules 2>&1 | tee -a $GITHUB_WORKSPACE/build.log
+        MOD_RC=${PIPESTATUS[0]}
 
-        if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+        if [ "$MOD_RC" -ne 0 ]; then
           echo "FATAL: in-tree modules build failed!"
           exit 1
         fi
         echo "In-tree modules built OK"
-
         echo "In-tree .ko count: $(find out -name '*.ko' | wc -l)"
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -865,22 +989,11 @@ jobs:
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 17a — Build TWRP flashable ZIP for direct vendor partition modification
-    # ══════════════════════════════════════════════════════════════════════════
+    #
     # WHY TWRP ZIP (NOT Magisk module):
-    #   CRITICAL TIMING ISSUE WITH MAGISK:
     #   1. Kernel loads modules from /vendor/lib/modules/ during EARLY boot
-    #   2. Magisk applies overlays LATE in boot (after zygote starts)
-    #   3. Result: Kernel can't find matching modules → bootloop BEFORE Magisk activates
-    #
-    #   TWRP SOLUTION:
-    #   - TWRP mounts /vendor partition DIRECTLY in recovery
-    #   - Files are copied BEFORE boot (not during boot)
-    #   - Kernel sees modified modules immediately on next boot
-    #
-    #   MODULE LOCATIONS (from phone_dir.txt):
-    #   - /vendor/lib/modules/          ← 99 .ko files (top-level)
-    #   - /vendor/lib/modules/5.4-gki/  ← 278 .ko files (GKI primary)
-    #   - vendor_boot ramdisk has ZERO .ko files — don't patch it!
+    #   2. Magisk applies overlays LATE (after zygote) → bootloop before activation
+    #   3. TWRP mounts /vendor DIRECTLY in recovery → files copied BEFORE boot
     # ══════════════════════════════════════════════════════════════════════════
     - name: Build TWRP vendor module flasher
       run: |
@@ -890,12 +1003,11 @@ jobs:
         mkdir -p $MODULES_DIR
         mkdir -p $MODULES_DIR/5.4-gki
 
-        # Collect all built .ko files and organize by target location
         echo "=== Collecting built .ko files ==="
-        
-        # First, collect all .ko files into a staging area
+
         STAGING_DIR=$TWRP_DIR/staging
         mkdir -p $STAGING_DIR
+
         IN_TREE_COUNT=0
         while IFS= read -r ko; do
           cp "$ko" $STAGING_DIR/
@@ -919,75 +1031,63 @@ jobs:
           exit 1
         fi
 
-        # Create the update-binary script (TWRP recovery installer)
         mkdir -p $TWRP_DIR/META-INF/com/google/android
         cat > $TWRP_DIR/META-INF/com/google/android/update-binary << 'UPDATE_BINARY_EOF'
         #!/sbin/sh
         # TWRP Flashable ZIP - Vendor Module Injector
         # OnePlus 9 Pro Stock Kernel Modules
-        
+
         OUTFD=$2
         ZIPFILE=$3
-        
-        # TWRP utility functions
+
         ui_print() { echo -e "ui_print $1\nui_print" > $OUTFD; }
         abort() { ui_print "$1"; exit 1; }
-        
-        # Get the temporary extraction directory
+
         TMPDIR=$(dirname "$ZIPFILE")/tmp
-        
+
         ui_print ""
         ui_print "========================================"
         ui_print "OnePlus 9 Pro Vendor Module Injector"
         ui_print "Kernel: 5.4.254-qgki-gd2a1055adeb0"
         ui_print "========================================"
         ui_print ""
-        
-        # Mount vendor partition
+
         ui_print "- Mounting /vendor partition..."
         if ! mount /vendor 2>/dev/null; then
-          # Try manual mount for TWRP
           mount -t ext4 /dev/block/by-name/vendor /vendor 2>/dev/null || \
           mount -t erofs /dev/block/by-name/vendor /vendor 2>/dev/null || \
           abort "! ERROR: Failed to mount /vendor partition"
         fi
         ui_print "  /vendor mounted successfully"
-        
-        # Verify vendor structure
+
         VENDOR_MODULES="/vendor/lib/modules"
         if [ ! -d "$VENDOR_MODULES" ]; then
           abort "! ERROR: $VENDOR_MODULES not found — wrong partition?"
         fi
-        
+
         ui_print ""
         ui_print "- Scanning stock module locations..."
-        
-        # Count existing modules
+
         TOP_LEVEL_COUNT=$(find $VENDOR_MODULES -maxdepth 1 -name "*.ko" | wc -l)
         GKI_COUNT=$(find $VENDOR_MODULES/5.4-gki -name "*.ko" 2>/dev/null | wc -l)
         ui_print "  Top-level modules: $TOP_LEVEL_COUNT"
         ui_print "  5.4-gki modules:   $GKI_COUNT"
         ui_print ""
-        
-        # Install modules - replace ALL matching files
+
         ui_print "- Installing built modules..."
         INSTALLED=0
         SKIPPED=0
-        
-        # Modules are extracted to the vendor/ directory in the ZIP
-        # We need to find what's in the ZIP and match against what's on device
+
         for ko in "$TMPDIR"/vendor/lib/modules/*.ko "$TMPDIR"/vendor/lib/modules/5.4-gki/*.ko; do
           [ -f "$ko" ] || continue
           filename=$(basename "$ko")
-          
-          # Determine target path based on source path
+
           if echo "$ko" | grep -q "5.4-gki"; then
             target="$VENDOR_MODULES/5.4-gki/$filename"
           else
             target="$VENDOR_MODULES/$filename"
           fi
-          
-          # Only copy if target exists on device (don't add new modules)
+
           if [ -f "$target" ]; then
             cp "$ko" "$target"
             chmod 644 "$target"
@@ -1001,7 +1101,7 @@ jobs:
             SKIPPED=$((SKIPPED + 1))
           fi
         done
-        
+
         ui_print ""
         ui_print "========================================"
         ui_print "Installation Summary:"
@@ -1009,77 +1109,57 @@ jobs:
         ui_print "  Skipped (not in stock):  $SKIPPED"
         ui_print "========================================"
         ui_print ""
-        
+
         if [ "$INSTALLED" -eq 0 ]; then
           ui_print "! WARNING: 0 modules installed"
-          ui_print "  This may be normal if kernel version"
-          ui_print "  exactly matches stock (no module update needed)"
+          ui_print "  This may be normal if no modules needed updating."
         else
           ui_print "- Modules will activate on next boot"
           ui_print "- Wipe Dalvik/Cache recommended"
         fi
-        
-        # Unmount vendor
+
         umount /vendor 2>/dev/null
-        
+
         ui_print ""
         ui_print "- Done!"
         ui_print "========================================"
         UPDATE_BINARY_EOF
 
-        # Make update-binary executable
         chmod +x $TWRP_DIR/META-INF/com/google/android/update-binary
 
-        # Create updater-script (minimal - update-binary does the real work)
-        # This is required for some recoveries but we let update-binary handle everything
         cat > $TWRP_DIR/META-INF/com/google/android/updater-script << 'UPDATER_EOF'
         #TWRP
-        # update-binary handles all the work - this is just a placeholder
-        assert(getprop("ro.product.device") == "lemonadep" || getprop("ro.build.product") == "lemonadep" || abort("ERROR: This package is for OnePlus 9 Pro (lemonadep) only!"));
+        assert(getprop("ro.product.device") == "lemonadep" || getprop("ro.build.product") == "lemonadep" || abort("ERROR: OnePlus 9 Pro only!"));
         show_progress(1.0, 0);
         UPDATER_EOF
 
-        # Copy staged modules to the ZIP's vendor directory structure
-        # They will be extracted to /vendor by the update-binary
         cp $STAGING_DIR/*.ko $MODULES_DIR/ 2>/dev/null || true
         cp $STAGING_DIR/*.ko $MODULES_DIR/5.4-gki/ 2>/dev/null || true
 
-        # Create installation info
         cat > $TWRP_DIR/INSTALL.txt << 'INSTALL_EOF'
         OnePlus 9 Pro Vendor Module Injector
         =====================================
-        
-        FLASH INSTRUCTIONS:
+
+        FLASH ORDER:
         1. Boot to TWRP/OrangeFox recovery
-        2. Flash kernel ZIP first (Stock-Base-OP9Pro-*.zip)
-        3. Flash this ZIP second (OP9Pro-Kernel-Modules-TWRP.zip)
-        4. Wipe Dalvik/Cache (recommended)
+        2. Flash kernel ZIP first  (Stock-Base-OP9Pro-*.zip)
+        3. Flash this ZIP second   (OP9Pro-Kernel-Modules-TWRP.zip)
+        4. Wipe Dalvik/Cache
         5. Reboot system
-        
-        WHAT THIS DOES:
-        - Directly modifies /vendor/lib/modules/ partition
-        - Replaces stock modules with newly built ones
-        - Handles both top-level and 5.4-gki subdirectory
-        
-        WARNING:
-        - This is a PERMANENT modification (not systemless)
-        - To revert: flash stock vendor.img via fastboot
+
+        WARNING: This permanently modifies /vendor. To revert: flash stock vendor.img via fastboot.
         INSTALL_EOF
-        
-        # Verify structure
+
         echo "=== TWRP module structure ==="
         ls -lh $TWRP_DIR/
         echo ""
         echo "=== META-INF contents ==="
         ls -lh $TWRP_DIR/META-INF/com/google/android/
         echo ""
-        echo "=== vendor/lib/modules/ contents ==="
-        ls $MODULES_DIR/*.ko 2>/dev/null | wc -l
-        echo "  .ko files in top-level"
-        ls $MODULES_DIR/5.4-gki/*.ko 2>/dev/null | wc -l
-        echo "  .ko files in 5.4-gki/"
+        echo "=== vendor/lib/modules/ counts ==="
+        echo "  top-level: $(ls $MODULES_DIR/*.ko 2>/dev/null | wc -l) .ko files"
+        echo "  5.4-gki/:  $(ls $MODULES_DIR/5.4-gki/*.ko 2>/dev/null | wc -l) .ko files"
 
-        # Package into flashable zip
         echo ""
         echo "=== Packaging TWRP flashable ZIP ==="
         cd $TWRP_DIR
@@ -1089,31 +1169,7 @@ jobs:
           INSTALL.txt \
           2>&1
         TWRP_ZIP_SIZE=$(du -h $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip | cut -f1)
-        echo ""
         echo "✓ TWRP ZIP created: $TWRP_ZIP_SIZE"
-        echo "  $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip"
-        echo ""
-        echo "=== FLASH ORDER (CRITICAL) ==="
-        echo "  1. Boot to TWRP/OrangeFox recovery"
-        echo "  2. Flash: Stock-Base-OP9Pro-*.zip (kernel Image via AK3)"
-        echo "  3. Flash: OP9Pro-Kernel-Modules-TWRP.zip (direct vendor mod)"
-        echo "  4. Wipe Dalvik/Cache"
-        echo "  5. Reboot system"
-        echo ""
-        echo "=== ALTERNATIVE (if kernel-only works) ==="
-        echo "  If MODVERSIONS is disabled and kernel version matches,"
-        echo "  you may only need to flash the kernel ZIP (Method 1)."
-        echo "  Try that first before using this TWRP module injector."
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # STEP 17b — Upload TWRP vendor module ZIP
-    # ══════════════════════════════════════════════════════════════════════════
-    - name: Upload TWRP vendor module ZIP
-      uses: actions/upload-artifact@v4
-      with:
-        name: OP9Pro-Kernel-Modules-TWRP
-        path: ${{ github.workspace }}/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip
-        retention-days: 30
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 18 — Create flashable AK3 ZIP
@@ -1136,20 +1192,17 @@ jobs:
         echo "FLASH INSTRUCTIONS (TWRP/OrangeFox Recovery)"
         echo "=============================================="
         echo ""
-        echo "METHOD 1 - KERNEL ONLY (TRY FIRST):"
+        echo "METHOD 1 — KERNEL ONLY (try this first):"
         echo "  1. Flash: $ZIP_NAME"
         echo "  2. Reboot system"
-        echo "  If phone boots: SUCCESS (no module flash needed)"
-        echo "  If bootloop: use Method 2"
+        echo "  If phone boots → SUCCESS (no module flash needed)"
+        echo "  If bootloop   → use Method 2"
         echo ""
-        echo "METHOD 2 - KERNEL + VENDOR MODULES (IF BOOTLOOP):"
-        echo "  1. Flash: $ZIP_NAME (kernel)"
-        echo "  2. Flash: OP9Pro-Kernel-Modules-TWRP.zip (vendor)"
+        echo "METHOD 2 — KERNEL + VENDOR MODULES (if bootloop):"
+        echo "  1. Flash: $ZIP_NAME"
+        echo "  2. Flash: OP9Pro-Kernel-Modules-TWRP.zip"
         echo "  3. Wipe Dalvik/Cache"
         echo "  4. Reboot system"
-        echo ""
-        echo "DO NOT USE MAGISK MODULE FOR KERNEL MODULES"
-        echo "  (Magisk loads too late - causes bootloop)"
         echo "=============================================="
 
     # ══════════════════════════════════════════════════════════════════════════
