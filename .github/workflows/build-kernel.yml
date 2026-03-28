@@ -446,7 +446,8 @@ jobs:
           --enable DRM_OPLUS_NOTIFY \
           --enable DRM_OPLUS_PANEL_NOTIFY \
           --enable OPLUS_BINDER_STATS_ENABLE \
-          --enable BUILD_ARM64_DT_OVERLAY
+          --enable BUILD_ARM64_DT_OVERLAY \
+          --disable CONT_PTE_HUGEPAGE
 
         # Apply the changes
         make O=out \
@@ -469,7 +470,7 @@ jobs:
 
         # Verify critical config values
         echo "=== Config verification ==="
-        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER" out/.config || true
+        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER|CONT_PTE_HUGEPAGE" out/.config || true
         grep "CONFIG_LOCALVERSION" out/.config
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -537,10 +538,68 @@ jobs:
 
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9c — Fix fingerprint driver include path
+    # STEP 9c — Fix compilation errors in kernel source
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Fix fingerprint driver include path
+    - name: Fix compilation errors in kernel source
       run: |
+        echo "=== Fix 1: Add missing magic.h include for cont_pte_hugepage.c ==="
+        CONT_PTE_FILE="$GITHUB_WORKSPACE/kernel_source/mm/cont_pte_hugepage.c"
+        if [ -f "$CONT_PTE_FILE" ]; then
+          # Check if magic.h is already included
+          if ! grep -q "#include <linux/magic.h>" "$CONT_PTE_FILE"; then
+            # Add the include after the existing includes
+            sed -i '/#include <linux\/mm.h>/a #include <linux/magic.h>' "$CONT_PTE_FILE"
+            echo "  Added #include <linux/magic.h> to cont_pte_hugepage.c"
+          else
+            echo "  magic.h already included"
+          fi
+          # Verify the fix
+          grep "#include <linux/magic.h>" "$CONT_PTE_FILE" && echo "  Fix verified"
+        else
+          echo "  cont_pte_hugepage.c not found"
+        fi
+
+        echo ""
+        echo "=== Fix 2: Disable problematic UAG cpufreq governor code ==="
+        # The UAG governor has undefined symbols (cpufreq_idle_cpu_lock, cpufreq_idle_cpu, prev_frame_loading)
+        # These are OPlus-specific modifications with missing dependencies
+        # We'll wrap the problematic code sections in #if 0 ... #endif
+        UAG_FILE="$GITHUB_WORKSPACE/kernel_source/kernel/uad/cpufreq_uag_main.c"
+        if [ -f "$UAG_FILE" ]; then
+          # Find and comment out the problematic function that uses undefined symbols
+          # The errors are in lines around 627-632 and 784-788
+          # We'll use sed to wrap the problematic code blocks
+          
+          # Fix line 627-632: cpufreq_idle_cpu_lock and cpufreq_idle_cpu usage
+          sed -i 's/spin_lock_irqsave(\&cpufreq_idle_cpu_lock/\/\/ spin_lock_irqsave_disabled/g' "$UAG_FILE"
+          sed -i 's/spin_unlock_irqrestore(\&cpufreq_idle_cpu_lock/\/\/ spin_unlock_irqrestore_disabled/g' "$UAG_FILE"
+          sed -i 's/cpumask_clear(cpufreq_idle_cpu/\/\/ cpumask_clear_disabled/g' "$UAG_FILE"
+          sed -i 's/cpumask_set_cpu(cpu, cpufreq_idle_cpu/\/\/ cpumask_set_cpu_disabled/g' "$UAG_FILE"
+          
+          # Fix line 784-788: prev_frame_loading struct member
+          sed -i 's/ucpu->prev_frame_loading/\/\/ ucpu->prev_frame_loading_disabled/g' "$UAG_FILE"
+          
+          echo "  Commented out problematic UAG governor code references"
+          echo "  Note: This may cause linker errors if the functions are called"
+        else
+          echo "  cpufreq_uag_main.c not found"
+        fi
+
+        echo ""
+        echo "=== Fix 3: Remove UAG governor from build entirely ==="
+        # Alternative: Remove the UAG governor object file from the build
+        UAG_MAKEFILE="$GITHUB_WORKSPACE/kernel_source/kernel/uad/Makefile"
+        if [ -f "$UAG_MAKEFILE" ]; then
+          # Comment out the line that adds cpufreq_uag.o to the build
+          sed -i 's/^obj-\$(CONFIG_CPU_FREQ_GOV_UAG)/# obj-$(CONFIG_CPU_FREQ_GOV_UAG)/g' "$UAG_MAKEFILE"
+          sed -i 's/^obj-\$(CONFIG_UAG_GOV)/# obj-$(CONFIG_UAG_GOV)/g' "$UAG_MAKEFILE"
+          echo "  Removed UAG governor from Makefile build"
+        else
+          echo "  kernel/uad/Makefile not found"
+        fi
+
+        echo ""
+        echo "=== Fix 4: Fix fingerprint driver include path ==="
         for search_root in \
           "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
           "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
@@ -928,27 +987,27 @@ jobs:
         # Create the update-binary script (TWRP recovery installer)
         mkdir -p $TWRP_DIR/META-INF/com/google/android
         cat > $TWRP_DIR/META-INF/com/google/android/update-binary << 'UPDATE_BINARY_EOF'
-          #!/sbin/sh
-          # TWRP Flashable ZIP - Vendor Module Injector
-          # OnePlus 9 Pro Stock Kernel Modules
-          
-          OUTFD=$2
-          ZIPFILE=$3
-          
-          # TWRP utility functions
-          ui_print() { echo -e "ui_print $1\nui_print" > $OUTFD; }
-          abort() { ui_print "$1"; exit 1; }
-          
-          ui_print ""
-          ui_print "========================================"
-          ui_print "OnePlus 9 Pro Vendor Module Injector"
-          ui_print "Kernel: 5.4.254-qgki-gd2a1055adeb0"
-          ui_print "========================================"
-          ui_print ""
-          
-          # Mount vendor partition
-          ui_print "- Mounting /vendor partition..."
-          if ! mount /vendor 2>/dev/null; then
+        #!/sbin/sh
+        # TWRP Flashable ZIP - Vendor Module Injector
+        # OnePlus 9 Pro Stock Kernel Modules
+        
+        OUTFD=$2
+        ZIPFILE=$3
+        
+        # TWRP utility functions
+        ui_print() { echo -e "ui_print $1\nui_print" > $OUTFD; }
+        abort() { ui_print "$1"; exit 1; }
+        
+        ui_print ""
+        ui_print "========================================"
+        ui_print "OnePlus 9 Pro Vendor Module Injector"
+        ui_print "Kernel: 5.4.254-qgki-gd2a1055adeb0"
+        ui_print "========================================"
+        ui_print ""
+        
+        # Mount vendor partition
+        ui_print "- Mounting /vendor partition..."
+        if ! mount /vendor 2>/dev/null; then
           # Try manual mount for TWRP
           mount -t ext4 /dev/block/by-name/vendor /vendor 2>/dev/null || \
           mount -t erofs /dev/block/by-name/vendor /vendor 2>/dev/null || \
@@ -993,7 +1052,7 @@ jobs:
             FOUND_ANY=1
             INSTALLED=$((INSTALLED + 1))
           fi
-  
+          
           # Check 5.4-gki subdirectory
           if [ -f "$VENDOR_MODULES/5.4-gki/$filename" ]; then
             cp "$ko" "$VENDOR_MODULES/5.4-gki/$filename"
@@ -1004,35 +1063,35 @@ jobs:
           fi
           
           if [ "$FOUND_ANY" -eq 0 ]; then
-              # Module doesn't exist on stock - skip it (don't add unknown modules)
-              SKIPPED=$((SKIPPED + 1))
-            fi
-          done
-          
-          ui_print ""
-          ui_print "========================================"
-          ui_print "Installation Summary:"
-          ui_print "  Module copies installed: $INSTALLED"
-          ui_print "  Skipped (not in stock):  $SKIPPED"
-          ui_print "========================================"
-          ui_print ""
-          
-          if [ "$INSTALLED" -eq 0 ]; then
-            ui_print "! WARNING: 0 modules installed"
-            ui_print "  This may be normal if kernel version"
-            ui_print "  exactly matches stock (no module update needed)"
-          else
-            ui_print "- Modules will activate on next boot"
-            ui_print "- Wipe Dalvik/Cache recommended"
+            # Module doesn't exist on stock - skip it (don't add unknown modules)
+            SKIPPED=$((SKIPPED + 1))
           fi
-          
-          # Unmount vendor
-          umount /vendor 2>/dev/null
-          
-          ui_print ""
-          ui_print "- Done!"
-          ui_print "========================================"
-          UPDATE_BINARY_EOF
+        done
+        
+        ui_print ""
+        ui_print "========================================"
+        ui_print "Installation Summary:"
+        ui_print "  Module copies installed: $INSTALLED"
+        ui_print "  Skipped (not in stock):  $SKIPPED"
+        ui_print "========================================"
+        ui_print ""
+        
+        if [ "$INSTALLED" -eq 0 ]; then
+          ui_print "! WARNING: 0 modules installed"
+          ui_print "  This may be normal if kernel version"
+          ui_print "  exactly matches stock (no module update needed)"
+        else
+          ui_print "- Modules will activate on next boot"
+          ui_print "- Wipe Dalvik/Cache recommended"
+        fi
+        
+        # Unmount vendor
+        umount /vendor 2>/dev/null
+        
+        ui_print ""
+        ui_print "- Done!"
+        ui_print "========================================"
+        UPDATE_BINARY_EOF
 
         # Make update-binary executable
         chmod +x $TWRP_DIR/META-INF/com/google/android/update-binary
@@ -1073,7 +1132,7 @@ jobs:
         - This is a PERMANENT modification (not systemless)
         - To revert: flash stock vendor.img via fastboot
         INSTALL_EOF
-
+        
         # Verify structure
         echo "=== TWRP module structure ==="
         ls -lh $TWRP_DIR/
