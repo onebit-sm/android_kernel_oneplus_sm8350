@@ -945,6 +945,9 @@ jobs:
         ui_print() { echo -e "ui_print $1\nui_print" > $OUTFD; }
         abort() { ui_print "$1"; exit 1; }
         
+        # Get the temporary extraction directory
+        TMPDIR=$(dirname "$ZIPFILE")/tmp
+        
         ui_print ""
         ui_print "========================================"
         ui_print "OnePlus 9 Pro Vendor Module Injector"
@@ -983,34 +986,30 @@ jobs:
         INSTALLED=0
         SKIPPED=0
         
-        for ko in $TMPDIR/staging/*.ko; do
+        # Modules are extracted to the vendor/ directory in the ZIP
+        # We need to find what's in the ZIP and match against what's on device
+        for ko in "$TMPDIR"/vendor/lib/modules/*.ko "$TMPDIR"/vendor/lib/modules/5.4-gki/*.ko; do
           [ -f "$ko" ] || continue
           filename=$(basename "$ko")
           
-          # Find ALL locations where this module exists (top-level AND 5.4-gki)
-          # This handles the 57 modules that exist in BOTH locations
-          FOUND_ANY=0
-          
-          # Check top-level
-          if [ -f "$VENDOR_MODULES/$filename" ]; then
-            cp "$ko" "$VENDOR_MODULES/$filename"
-            chmod 644 "$VENDOR_MODULES/$filename"
-            ui_print "  [OK] lib/modules/$filename"
-            FOUND_ANY=1
-            INSTALLED=$((INSTALLED + 1))
+          # Determine target path based on source path
+          if echo "$ko" | grep -q "5.4-gki"; then
+            target="$VENDOR_MODULES/5.4-gki/$filename"
+          else
+            target="$VENDOR_MODULES/$filename"
           fi
           
-          # Check 5.4-gki subdirectory
-          if [ -f "$VENDOR_MODULES/5.4-gki/$filename" ]; then
-            cp "$ko" "$VENDOR_MODULES/5.4-gki/$filename"
-            chmod 644 "$VENDOR_MODULES/5.4-gki/$filename"
-            ui_print "  [OK] lib/modules/5.4-gki/$filename"
-            FOUND_ANY=1
+          # Only copy if target exists on device (don't add new modules)
+          if [ -f "$target" ]; then
+            cp "$ko" "$target"
+            chmod 644 "$target"
+            if echo "$ko" | grep -q "5.4-gki"; then
+              ui_print "  [OK] lib/modules/5.4-gki/$filename"
+            else
+              ui_print "  [OK] lib/modules/$filename"
+            fi
             INSTALLED=$((INSTALLED + 1))
-          fi
-          
-          if [ "$FOUND_ANY" -eq 0 ]; then
-            # Module doesn't exist on stock - skip it (don't add unknown modules)
+          else
             SKIPPED=$((SKIPPED + 1))
           fi
         done
@@ -1043,14 +1042,13 @@ jobs:
         # Make update-binary executable
         chmod +x $TWRP_DIR/META-INF/com/google/android/update-binary
 
-        # Create updater-script (required for some recoveries)
+        # Create updater-script (minimal - update-binary does the real work)
+        # This is required for some recoveries but we let update-binary handle everything
         cat > $TWRP_DIR/META-INF/com/google/android/updater-script << 'UPDATER_EOF'
         #TWRP
+        # update-binary handles all the work - this is just a placeholder
         assert(getprop("ro.product.device") == "lemonadep" || getprop("ro.build.product") == "lemonadep" || abort("ERROR: This package is for OnePlus 9 Pro (lemonadep) only!"));
         show_progress(1.0, 0);
-        mount("ext4", "EMMC", "/dev/block/by-name/vendor", "/vendor");
-        package_extract_dir("vendor", "/vendor");
-        umount("/vendor");
         UPDATER_EOF
 
         # Copy staged modules to the ZIP's vendor directory structure
