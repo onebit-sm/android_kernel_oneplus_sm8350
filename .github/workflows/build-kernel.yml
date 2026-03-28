@@ -429,8 +429,7 @@ jobs:
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-android- \
-          CROSS_COMPILE_COMPAT=arm-linux-androideabi- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
           vendor/lahaina-qgki_defconfig
@@ -439,38 +438,27 @@ jobs:
           --set-str LOCALVERSION "-qgki-gd2a1055adeb0" \
           --disable LOCALVERSION_AUTO \
           --disable MODVERSIONS \
-          --disable MODULE_SIG \
-          --disable MODULE_SIG_ALL \
           --disable MODULE_SIG_FORCE \
+          --disable MODULE_SIG_ALL \
           --enable QCOM_COMMAND_DB \
           --enable DRM_OPLUS_NOTIFY \
           --enable DRM_OPLUS_PANEL_NOTIFY \
           --enable OPLUS_BINDER_STATS_ENABLE \
-          --enable BUILD_ARM64_DT_OVERLAY \
-          --disable CONT_PTE_HUGEPAGE
+          --enable BUILD_ARM64_DT_OVERLAY
 
         # Apply the changes
         make O=out \
           ARCH=arm64 \
           CC=clang \
           CLANG_TRIPLE=aarch64-linux-gnu- \
-          CROSS_COMPILE=aarch64-linux-android- \
-          CROSS_COMPILE_COMPAT=arm-linux-androideabi- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
           LLVM=1 \
           LLVM_IAS=1 \
           olddefconfig
 
-        # CRITICAL: Re-disable MODVERSIONS after olddefconfig (belt-and-suspenders)
-        scripts/config --file out/.config \
-          --disable MODVERSIONS \
-          --disable MODULE_SIG \
-          --disable MODULE_SIG_ALL
-
-        make O=out olddefconfig
-
         # Verify critical config values
         echo "=== Config verification ==="
-        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER|CONT_PTE_HUGEPAGE" out/.config || true
+        grep -E "LOCALVERSION_AUTO|MODVERSIONS|MODULE_SIG|DRM_OPLUS|QCOM_COMMAND_DB|OPLUS_BINDER" out/.config || true
         grep "CONFIG_LOCALVERSION" out/.config
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -538,80 +526,10 @@ jobs:
 
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 9c — Fix compilation errors in kernel source
+    # STEP 9c — Fix fingerprint driver include path (from original script)
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Fix compilation errors in kernel source
+    - name: Fix fingerprint driver include path
       run: |
-        echo "=== Fix 1: Add missing magic.h include for cont_pte_hugepage.c ==="
-        CONT_PTE_FILE="$GITHUB_WORKSPACE/kernel_source/mm/cont_pte_hugepage.c"
-        if [ -f "$CONT_PTE_FILE" ]; then
-          # Check if magic.h is already included
-          if ! grep -q "#include <linux/magic.h>" "$CONT_PTE_FILE"; then
-            # Add the include after the existing includes
-            sed -i '/#include <linux\/mm.h>/a #include <linux/magic.h>' "$CONT_PTE_FILE"
-            echo "  Added #include <linux/magic.h> to cont_pte_hugepage.c"
-          else
-            echo "  magic.h already included"
-          fi
-          # Verify the fix
-          grep "#include <linux/magic.h>" "$CONT_PTE_FILE" && echo "  Fix verified"
-        else
-          echo "  cont_pte_hugepage.c not found"
-        fi
-
-        echo ""
-        echo "=== Fix 2: Fix missing semicolon in huge_memory.c ==="
-        HUGE_MEM_FILE="$GITHUB_WORKSPACE/kernel_source/mm/huge_memory.c"
-        if [ -f "$HUGE_MEM_FILE" ]; then
-          # Fix line 2810: missing semicolon after HPAGE_PMD_NR
-          # The line is: _total_mapcount -= HPAGE_PMD_NR
-          # Should be:   _total_mapcount -= HPAGE_PMD_NR;
-          sed -i 's/_total_mapcount -= HPAGE_PMD_NR$/_total_mapcount -= HPAGE_PMD_NR;/' "$HUGE_MEM_FILE"
-          echo "  Fixed missing semicolon in huge_memory.c"
-          # Verify
-          grep "_total_mapcount -= HPAGE_PMD_NR;" "$HUGE_MEM_FILE" && echo "  Fix verified"
-        else
-          echo "  huge_memory.c not found"
-        fi
-
-        echo ""
-        echo "=== Fix 3: Completely remove UAG governor from build ==="
-        # The UAG governor has undefined symbols that can't be easily fixed
-        # We'll completely remove it from the build by modifying the Kconfig and Makefile
-        
-        # Step 3a: Remove from kernel/uad/Makefile
-        UAG_MAKEFILE="$GITHUB_WORKSPACE/kernel_source/kernel/uad/Makefile"
-        if [ -f "$UAG_MAKEFILE" ]; then
-          echo "  Modifying $UAG_MAKEFILE..."
-          # Comment out ALL lines that reference cpufreq_uag or UAG
-          sed -i 's/^obj-.*cpufreq_uag/# obj- # DISABLED UAG/g' "$UAG_MAKEFILE"
-          sed -i 's/^obj-.*UAG_GOV/# obj- # DISABLED UAG/g' "$UAG_MAKEFILE"
-          sed -i 's/^cpufreq_uag-objs/# cpufreq_uag-objs # DISABLED UAG/g' "$UAG_MAKEFILE"
-          
-          # Show what was changed
-          echo "  Modified Makefile contents:"
-          cat "$UAG_MAKEFILE"
-        else
-          echo "  kernel/uad/Makefile not found - searching for it..."
-          find "$GITHUB_WORKSPACE/kernel_source" -name "Makefile" -path "*/uad/*" 2>/dev/null
-        fi
-        
-        # Step 3b: Also disable in the parent Makefile if it exists
-        PARENT_MK="$GITHUB_WORKSPACE/kernel_source/kernel/Makefile"
-        if [ -f "$PARENT_MK" ]; then
-          sed -i 's/^obj-.*uad/# obj- # DISABLED UAD/g' "$PARENT_MK"
-          echo "  Modified kernel/Makefile to disable uad subdirectory"
-        fi
-        
-        # Step 3c: Rename the source file to prevent compilation
-        UAG_SRC="$GITHUB_WORKSPACE/kernel_source/kernel/uad/cpufreq_uag_main.c"
-        if [ -f "$UAG_SRC" ]; then
-          mv "$UAG_SRC" "${UAG_SRC}.DISABLED"
-          echo "  Renamed cpufreq_uag_main.c to cpufreq_uag_main.c.DISABLED"
-        fi
-
-        echo ""
-        echo "=== Fix 4: Fix fingerprint driver include path ==="
         for search_root in \
           "$GITHUB_WORKSPACE/kernel_source/drivers/input" \
           "$GITHUB_WORKSPACE/vendor_modules/vendor/oplus/secure"
@@ -632,9 +550,6 @@ jobs:
         if [ -z "$FP_FILE" ]; then
           echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
         fi
-        
-        echo ""
-        echo "=== All compilation fixes applied ==="
 
 
     # ══════════════════════════════════════════════════════════════════════════
