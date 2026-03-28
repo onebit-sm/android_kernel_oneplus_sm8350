@@ -352,7 +352,7 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7 — Install build dependencies
     # ══════════════════════════════════════════════════════════════════════════
-        - name: Install dependencies
+    - name: Install dependencies
       run: |
         sudo apt-get update -qq
         
