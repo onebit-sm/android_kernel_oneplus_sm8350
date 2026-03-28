@@ -870,39 +870,53 @@ jobs:
         fi
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 17a — Build Magisk module for vendor kernel module injection
+    # STEP 17a — Build TWRP flashable ZIP for direct vendor partition modification
     # ══════════════════════════════════════════════════════════════════════════
-    # WHY MAGISK MODULE (not vendor_boot ramdisk patching):
-    #   Your phone's modules live at:
-    #     /vendor/lib/modules/          ← 99 .ko (top-level)
-    #     /vendor/lib/modules/5.4-gki/  ← 278 .ko (GKI primary path)
-    #   The vendor_boot ramdisk contains ZERO .ko files — patching it is wrong.
-    #   A Magisk module overlays /vendor/lib/modules at boot, which is correct.
+    # WHY TWRP ZIP (NOT Magisk module):
+    #   CRITICAL TIMING ISSUE WITH MAGISK:
+    #   1. Kernel loads modules from /vendor/lib/modules/ during EARLY boot
+    #   2. Magisk applies overlays LATE in boot (after zygote starts)
+    #   3. Result: Kernel can't find matching modules → bootloop BEFORE Magisk activates
+    #
+    #   TWRP SOLUTION:
+    #   - TWRP mounts /vendor partition DIRECTLY in recovery
+    #   - Files are copied BEFORE boot (not during boot)
+    #   - Kernel sees modified modules immediately on next boot
+    #
+    #   MODULE LOCATIONS (from phone_dir.txt):
+    #   - /vendor/lib/modules/          ← 99 .ko files (top-level)
+    #   - /vendor/lib/modules/5.4-gki/  ← 278 .ko files (GKI primary)
+    #   - vendor_boot ramdisk has ZERO .ko files — don't patch it!
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Build Magisk module for vendor kernel module injection
+    - name: Build TWRP vendor module flasher
       run: |
         mkdir -p $GITHUB_WORKSPACE/FinalOutput
-        MAGISK_DIR=$GITHUB_WORKSPACE/MagiskModule
-        CUSTOM_KO_DIR=$MAGISK_DIR/custom_ko
-        mkdir -p $CUSTOM_KO_DIR
+        TWRP_DIR=$GITHUB_WORKSPACE/TWRP_Module
+        MODULES_DIR=$TWRP_DIR/vendor/lib/modules
+        mkdir -p $MODULES_DIR
+        mkdir -p $MODULES_DIR/5.4-gki
 
-        # Collect all built .ko files
+        # Collect all built .ko files and organize by target location
         echo "=== Collecting built .ko files ==="
+        
+        # First, collect all .ko files into a staging area
+        STAGING_DIR=$TWRP_DIR/staging
+        mkdir -p $STAGING_DIR
         IN_TREE_COUNT=0
         while IFS= read -r ko; do
-          cp "$ko" $CUSTOM_KO_DIR/
+          cp "$ko" $STAGING_DIR/
           IN_TREE_COUNT=$((IN_TREE_COUNT + 1))
         done < <(find $GITHUB_WORKSPACE/kernel_source/out -name "*.ko" -type f 2>/dev/null)
         echo "  In-tree modules collected:     $IN_TREE_COUNT"
 
         OOT_COUNT=0
         while IFS= read -r ko; do
-          cp "$ko" $CUSTOM_KO_DIR/
+          cp "$ko" $STAGING_DIR/
           OOT_COUNT=$((OOT_COUNT + 1))
         done < <(find $GITHUB_WORKSPACE/vendor_modules/vendor/oplus/kernel -name "*.ko" -type f 2>/dev/null)
         echo "  Out-of-tree modules collected: $OOT_COUNT"
 
-        TOTAL_COLLECTED=$(ls $CUSTOM_KO_DIR/*.ko 2>/dev/null | wc -l)
+        TOTAL_COLLECTED=$(ls $STAGING_DIR/*.ko 2>/dev/null | wc -l)
         echo "  Total unique .ko files staged: $TOTAL_COLLECTED"
         echo ""
 
@@ -911,93 +925,202 @@ jobs:
           exit 1
         fi
 
-        # module.prop
-        cat > $MAGISK_DIR/module.prop << 'EOF'
-        id=op9pro_stock_kernel_modules
-        name=OnePlus 9 Pro Stock Kernel Modules
-        version=v1.0
-        versionCode=1
-        author=CustomBuild
-        description=Overlays /vendor/lib/modules with modules built from stock OOS 14 source (5.4.254-qgki-gd2a1055adeb0). Requires matching AK3 kernel flash.
-        EOF
-
-        # customize.sh — runs ON DEVICE during Magisk module install
-        cat > $MAGISK_DIR/customize.sh << 'CUSTOMIZE_EOF'
-        ui_print ""
-        ui_print "- OnePlus 9 Pro Stock Kernel Modules"
-        ui_print "- Kernel: 5.4.254-qgki-gd2a1055adeb0"
-        ui_print ""
-        VENDOR_MODULES_DIR="/vendor/lib/modules"
-        if [ ! -d "$VENDOR_MODULES_DIR" ]; then
-          abort "! ERROR: $VENDOR_MODULES_DIR not found"
+        # Create the update-binary script (TWRP recovery installer)
+        mkdir -p $TWRP_DIR/META-INF/com/google/android
+        cat > $TWRP_DIR/META-INF/com/google/android/update-binary << 'UPDATE_BINARY_EOF'
+          #!/sbin/sh
+          # TWRP Flashable ZIP - Vendor Module Injector
+          # OnePlus 9 Pro Stock Kernel Modules
+          
+          OUTFD=$2
+          ZIPFILE=$3
+          
+          # TWRP utility functions
+          ui_print() { echo -e "ui_print $1\nui_print" > $OUTFD; }
+          abort() { ui_print "$1"; exit 1; }
+          
+          ui_print ""
+          ui_print "========================================"
+          ui_print "OnePlus 9 Pro Vendor Module Injector"
+          ui_print "Kernel: 5.4.254-qgki-gd2a1055adeb0"
+          ui_print "========================================"
+          ui_print ""
+          
+          # Mount vendor partition
+          ui_print "- Mounting /vendor partition..."
+          if ! mount /vendor 2>/dev/null; then
+          # Try manual mount for TWRP
+          mount -t ext4 /dev/block/by-name/vendor /vendor 2>/dev/null || \
+          mount -t erofs /dev/block/by-name/vendor /vendor 2>/dev/null || \
+          abort "! ERROR: Failed to mount /vendor partition"
         fi
-        ui_print "- Scanning for matching modules..."
-        PLACED=0
+        ui_print "  /vendor mounted successfully"
+        
+        # Verify vendor structure
+        VENDOR_MODULES="/vendor/lib/modules"
+        if [ ! -d "$VENDOR_MODULES" ]; then
+          abort "! ERROR: $VENDOR_MODULES not found — wrong partition?"
+        fi
+        
+        ui_print ""
+        ui_print "- Scanning stock module locations..."
+        
+        # Count existing modules
+        TOP_LEVEL_COUNT=$(find $VENDOR_MODULES -maxdepth 1 -name "*.ko" | wc -l)
+        GKI_COUNT=$(find $VENDOR_MODULES/5.4-gki -name "*.ko" 2>/dev/null | wc -l)
+        ui_print "  Top-level modules: $TOP_LEVEL_COUNT"
+        ui_print "  5.4-gki modules:   $GKI_COUNT"
+        ui_print ""
+        
+        # Install modules - replace ALL matching files
+        ui_print "- Installing built modules..."
+        INSTALLED=0
         SKIPPED=0
-        for ko in "$MODPATH/custom_ko/"*.ko; do
+        
+        for ko in $TMPDIR/staging/*.ko; do
           [ -f "$ko" ] || continue
-          filename="${ko##*/}"
-          found_any=0
-          for sys_path in $(find "$VENDOR_MODULES_DIR" -type f -name "$filename" 2>/dev/null); do
-            found_any=1
-            rel="${sys_path#/vendor/}"
-            dest_dir="$MODPATH/vendor/${rel%/*}"
-            mkdir -p "$dest_dir"
-            cp "$ko" "$MODPATH/vendor/$rel" && {
-              ui_print "  + ${rel}"
-              PLACED=$((PLACED+1))
-            }
+          filename=$(basename "$ko")
+          
+          # Find ALL locations where this module exists (top-level AND 5.4-gki)
+          # This handles the 57 modules that exist in BOTH locations
+          FOUND_ANY=0
+          
+          # Check top-level
+          if [ -f "$VENDOR_MODULES/$filename" ]; then
+            cp "$ko" "$VENDOR_MODULES/$filename"
+            chmod 644 "$VENDOR_MODULES/$filename"
+            ui_print "  [OK] lib/modules/$filename"
+            FOUND_ANY=1
+            INSTALLED=$((INSTALLED + 1))
+          fi
+  
+          # Check 5.4-gki subdirectory
+          if [ -f "$VENDOR_MODULES/5.4-gki/$filename" ]; then
+            cp "$ko" "$VENDOR_MODULES/5.4-gki/$filename"
+            chmod 644 "$VENDOR_MODULES/5.4-gki/$filename"
+            ui_print "  [OK] lib/modules/5.4-gki/$filename"
+            FOUND_ANY=1
+            INSTALLED=$((INSTALLED + 1))
+          fi
+          
+          if [ "$FOUND_ANY" -eq 0 ]; then
+              # Module doesn't exist on stock - skip it (don't add unknown modules)
+              SKIPPED=$((SKIPPED + 1))
+            fi
           done
-          [ "$found_any" -eq 0 ] && SKIPPED=$((SKIPPED+1))
-        done
-        rm -rf "$MODPATH/custom_ko"
-        ui_print ""
-        ui_print "  Injected : $PLACED"
-        ui_print "  Skipped  : $SKIPPED (built but not in stock vendor)"
-        ui_print ""
-        [ "$PLACED" -gt 0 ] && ui_print "- Done. Reboot to activate." || \
-          ui_print "! WARNING: 0 modules placed — check kernel version"
-        CUSTOMIZE_EOF
+          
+          ui_print ""
+          ui_print "========================================"
+          ui_print "Installation Summary:"
+          ui_print "  Module copies installed: $INSTALLED"
+          ui_print "  Skipped (not in stock):  $SKIPPED"
+          ui_print "========================================"
+          ui_print ""
+          
+          if [ "$INSTALLED" -eq 0 ]; then
+            ui_print "! WARNING: 0 modules installed"
+            ui_print "  This may be normal if kernel version"
+            ui_print "  exactly matches stock (no module update needed)"
+          else
+            ui_print "- Modules will activate on next boot"
+            ui_print "- Wipe Dalvik/Cache recommended"
+          fi
+          
+          # Unmount vendor
+          umount /vendor 2>/dev/null
+          
+          ui_print ""
+          ui_print "- Done!"
+          ui_print "========================================"
+          UPDATE_BINARY_EOF
 
-        # Verify the module structure
-        echo "=== Magisk module structure ==="
-        ls -lh $MAGISK_DIR/
+        # Make update-binary executable
+        chmod +x $TWRP_DIR/META-INF/com/google/android/update-binary
+
+        # Create updater-script (required for some recoveries)
+        cat > $TWRP_DIR/META-INF/com/google/android/updater-script << 'UPDATER_EOF'
+        #TWRP
+        assert(getprop("ro.product.device") == "lemonadep" || getprop("ro.build.product") == "lemonadep" || abort("ERROR: This package is for OnePlus 9 Pro (lemonadep) only!"));
+        show_progress(1.0, 0);
+        mount("ext4", "EMMC", "/dev/block/by-name/vendor", "/vendor");
+        package_extract_dir("vendor", "/vendor");
+        umount("/vendor");
+        UPDATER_EOF
+
+        # Copy staged modules to the ZIP's vendor directory structure
+        # They will be extracted to /vendor by the update-binary
+        cp $STAGING_DIR/*.ko $MODULES_DIR/ 2>/dev/null || true
+        cp $STAGING_DIR/*.ko $MODULES_DIR/5.4-gki/ 2>/dev/null || true
+
+        # Create installation info
+        cat > $TWRP_DIR/INSTALL.txt << 'INSTALL_EOF'
+        OnePlus 9 Pro Vendor Module Injector
+        =====================================
+        
+        FLASH INSTRUCTIONS:
+        1. Boot to TWRP/OrangeFox recovery
+        2. Flash kernel ZIP first (Stock-Base-OP9Pro-*.zip)
+        3. Flash this ZIP second (OP9Pro-Kernel-Modules-TWRP.zip)
+        4. Wipe Dalvik/Cache (recommended)
+        5. Reboot system
+        
+        WHAT THIS DOES:
+        - Directly modifies /vendor/lib/modules/ partition
+        - Replaces stock modules with newly built ones
+        - Handles both top-level and 5.4-gki subdirectory
+        
+        WARNING:
+        - This is a PERMANENT modification (not systemless)
+        - To revert: flash stock vendor.img via fastboot
+        INSTALL_EOF
+
+        # Verify structure
+        echo "=== TWRP module structure ==="
+        ls -lh $TWRP_DIR/
         echo ""
-        echo "=== module.prop ==="
-        cat $MAGISK_DIR/module.prop
+        echo "=== META-INF contents ==="
+        ls -lh $TWRP_DIR/META-INF/com/google/android/
         echo ""
-        echo "=== customize.sh (first 20 lines) ==="
-        head -20 $MAGISK_DIR/customize.sh
+        echo "=== vendor/lib/modules/ contents ==="
+        ls $MODULES_DIR/*.ko 2>/dev/null | wc -l
+        echo "  .ko files in top-level"
+        ls $MODULES_DIR/5.4-gki/*.ko 2>/dev/null | wc -l
+        echo "  .ko files in 5.4-gki/"
 
         # Package into flashable zip
         echo ""
-        echo "=== Packaging Magisk module ZIP ==="
-        cd $MAGISK_DIR
-        zip -r9 $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules.zip \
-          module.prop \
-          customize.sh \
-          custom_ko/ \
+        echo "=== Packaging TWRP flashable ZIP ==="
+        cd $TWRP_DIR
+        zip -r9 $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip \
+          META-INF/ \
+          vendor/ \
+          INSTALL.txt \
           2>&1
-        MODULE_ZIP_SIZE=$(du -h $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules.zip | cut -f1)
+        TWRP_ZIP_SIZE=$(du -h $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip | cut -f1)
         echo ""
-        echo "✓ Magisk module ZIP: $MODULE_ZIP_SIZE"
-        echo "  $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules.zip"
+        echo "✓ TWRP ZIP created: $TWRP_ZIP_SIZE"
+        echo "  $GITHUB_WORKSPACE/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip"
         echo ""
-        echo "=== Flash order ==="
-        echo "  1. Boot to recovery (OrangeFox/TWRP)"
-        echo "  2. Flash AK3 kernel ZIP first (replaces kernel Image in boot partition)"
-        echo "  3. Boot to system with Magisk installed"
-        echo "  4. Install OP9Pro-Kernel-Modules.zip via Magisk Manager"
-        echo "  5. Reboot — custom modules overlay /vendor/lib/modules"
+        echo "=== FLASH ORDER (CRITICAL) ==="
+        echo "  1. Boot to TWRP/OrangeFox recovery"
+        echo "  2. Flash: Stock-Base-OP9Pro-*.zip (kernel Image via AK3)"
+        echo "  3. Flash: OP9Pro-Kernel-Modules-TWRP.zip (direct vendor mod)"
+        echo "  4. Wipe Dalvik/Cache"
+        echo "  5. Reboot system"
+        echo ""
+        echo "=== ALTERNATIVE (if kernel-only works) ==="
+        echo "  If MODVERSIONS is disabled and kernel version matches,"
+        echo "  you may only need to flash the kernel ZIP (Method 1)."
+        echo "  Try that first before using this TWRP module injector."
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STEP 17b — Upload Magisk module ZIP
+    # STEP 17b — Upload TWRP vendor module ZIP
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Upload Magisk module ZIP
+    - name: Upload TWRP vendor module ZIP
       uses: actions/upload-artifact@v4
       with:
-        name: OP9Pro-Kernel-Modules-Magisk
-        path: ${{ github.workspace }}/FinalOutput/OP9Pro-Kernel-Modules.zip
+        name: OP9Pro-Kernel-Modules-TWRP
+        path: ${{ github.workspace }}/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip
         retention-days: 30
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1017,9 +1140,25 @@ jobs:
         echo "=== Final artifacts ==="
         ls -lh $GITHUB_WORKSPACE/FinalOutput/
         echo ""
-        echo "Flash order:"
-        echo "  1. Recovery  → flash $ZIP_NAME (kernel Image)"
-        echo "  2. Magisk Mgr → install OP9Pro-Kernel-Modules.zip"
+        echo "=============================================="
+        echo "FLASH INSTRUCTIONS (TWRP/OrangeFox Recovery)"
+        echo "=============================================="
+        echo ""
+        echo "METHOD 1 - KERNEL ONLY (TRY FIRST):"
+        echo "  1. Flash: $ZIP_NAME"
+        echo "  2. Reboot system"
+        echo "  If phone boots: SUCCESS (no module flash needed)"
+        echo "  If bootloop: use Method 2"
+        echo ""
+        echo "METHOD 2 - KERNEL + VENDOR MODULES (IF BOOTLOOP):"
+        echo "  1. Flash: $ZIP_NAME (kernel)"
+        echo "  2. Flash: OP9Pro-Kernel-Modules-TWRP.zip (vendor)"
+        echo "  3. Wipe Dalvik/Cache"
+        echo "  4. Reboot system"
+        echo ""
+        echo "DO NOT USE MAGISK MODULE FOR KERNEL MODULES"
+        echo "  (Magisk loads too late - causes bootloop)"
+        echo "=============================================="
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 19 — Upload artifacts
@@ -1029,6 +1168,13 @@ jobs:
       with:
         name: Stock-Base-Kernel-OP9Pro
         path: ${{ github.workspace }}/FinalOutput/${{ env.ZIP_NAME }}
+        retention-days: 30
+
+    - name: Upload TWRP vendor module ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: OP9Pro-Kernel-Modules-TWRP
+        path: ${{ github.workspace }}/FinalOutput/OP9Pro-Kernel-Modules-TWRP.zip
         retention-days: 30
 
     - name: Upload build log
