@@ -901,25 +901,8 @@ jobs:
           DTB_SRC=$(find "$GITHUB_WORKSPACE/dtbs" -name "lahaina*.dtb" | sort | head -n 1)
         fi
 
-        if [ -n "$DTB_SRC" ] && [ -f "$DTB_SRC" ]; then
-          cp "$DTB_SRC" $AK/dtb
-          echo "✓ DTB packaged: $(basename "$DTB_SRC")"
-        else
-          echo "ERROR: No suitable Lahaina DTB found. Available DTBs:"
-          ls $GITHUB_WORKSPACE/dtbs/ | head -n 20
-          exit 1
-        fi
-
         # Assemble dtbo.img from all lemonade* overlays (cat is fine for QCOM)
-        echo "=== Assembling dtbo.img from lemonade overlays ==="
-        DTBO_FILES=$(find "$GITHUB_WORKSPACE/dtbs" -name "lemonade*.dtbo" | sort)
-        if [ -n "$DTBO_FILES" ]; then
-          cat $DTBO_FILES > $AK/dtbo.img
-          echo "✓ DTBO packaged: $(ls -lh $AK/dtbo.img | awk '{print $5}')"
-        else
-          echo "WARNING: No lemonade DTBO overlays found!"
-        fi
-
+        
         # NOTE: do.modules=0 in anykernel.sh — no vendor partition modules
         # are packaged. The vendor_boot ramdisk modules are handled
         # separately in Step 17a below.
