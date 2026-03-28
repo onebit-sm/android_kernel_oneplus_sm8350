@@ -356,6 +356,11 @@ jobs:
       run: |
         sudo apt-get update -qq
         sudo apt-get install -y \
+          bc bison build-essential ccache curl flex git kmod \
+          libelf-dev libssl-dev lz4 make python3 unzip zip zlib1g-dev \
+          binutils-aarch64-linux-gnu \
+          gcc-arm-linux-gnueabi \
+          binutils-arm-linux-gnueabi
           bc \
           bison \
           build-essential \
@@ -444,8 +449,8 @@ jobs:
           ARCH=arm64
           CC=clang
           CLANG_TRIPLE=aarch64-linux-gnu-
-          CROSS_COMPILE=aarch64-linux-android-
-          CROSS_COMPILE_COMPAT=arm-linux-androideabi-
+          CROSS_COMPILE=aarch64-linux-gnu-
+          CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
           LLVM=1
           LLVM_IAS=1
         )
