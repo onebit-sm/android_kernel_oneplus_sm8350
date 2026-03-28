@@ -720,12 +720,13 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     - name: Remove -Werror to allow warnings
       run: |
-        echo "=== Stripping -Werror from all Makefiles (including symlinked dirs) ==="
-        # Use -L to follow symlinks into techpack/ and other linked dirs
-        find -L $GITHUB_WORKSPACE/kernel_source -type f \
+        echo "=== Stripping -Werror from all Makefiles (excluding out/ dir to prevent symlink loops) ==="
+        # Use -L to follow symlinks, but -prune the out/ directory to avoid the infinite loop
+        find -L $GITHUB_WORKSPACE/kernel_source -path "*/out" -prune -o -type f \
           \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
           -exec sed -i 's/-Werror[a-zA-Z0-9_=-]*//g' {} +
-        find -L $GITHUB_WORKSPACE/kernel_source -type f \
+        
+        find -L $GITHUB_WORKSPACE/kernel_source -path "*/out" -prune -o -type f \
           \( -name "Makefile*" -o -name "Kbuild*" -o -name "*.mk" \) \
           -exec sed -i 's/-fmerge-constants//g' {} +
         echo "Done"
