@@ -560,42 +560,54 @@ jobs:
         fi
 
         echo ""
-        echo "=== Fix 2: Disable problematic UAG cpufreq governor code ==="
-        # The UAG governor has undefined symbols (cpufreq_idle_cpu_lock, cpufreq_idle_cpu, prev_frame_loading)
-        # These are OPlus-specific modifications with missing dependencies
-        # We'll wrap the problematic code sections in #if 0 ... #endif
-        UAG_FILE="$GITHUB_WORKSPACE/kernel_source/kernel/uad/cpufreq_uag_main.c"
-        if [ -f "$UAG_FILE" ]; then
-          # Find and comment out the problematic function that uses undefined symbols
-          # The errors are in lines around 627-632 and 784-788
-          # We'll use sed to wrap the problematic code blocks
-          
-          # Fix line 627-632: cpufreq_idle_cpu_lock and cpufreq_idle_cpu usage
-          sed -i 's/spin_lock_irqsave(\&cpufreq_idle_cpu_lock/\/\/ spin_lock_irqsave_disabled/g' "$UAG_FILE"
-          sed -i 's/spin_unlock_irqrestore(\&cpufreq_idle_cpu_lock/\/\/ spin_unlock_irqrestore_disabled/g' "$UAG_FILE"
-          sed -i 's/cpumask_clear(cpufreq_idle_cpu/\/\/ cpumask_clear_disabled/g' "$UAG_FILE"
-          sed -i 's/cpumask_set_cpu(cpu, cpufreq_idle_cpu/\/\/ cpumask_set_cpu_disabled/g' "$UAG_FILE"
-          
-          # Fix line 784-788: prev_frame_loading struct member
-          sed -i 's/ucpu->prev_frame_loading/\/\/ ucpu->prev_frame_loading_disabled/g' "$UAG_FILE"
-          
-          echo "  Commented out problematic UAG governor code references"
-          echo "  Note: This may cause linker errors if the functions are called"
+        echo "=== Fix 2: Fix missing semicolon in huge_memory.c ==="
+        HUGE_MEM_FILE="$GITHUB_WORKSPACE/kernel_source/mm/huge_memory.c"
+        if [ -f "$HUGE_MEM_FILE" ]; then
+          # Fix line 2810: missing semicolon after HPAGE_PMD_NR
+          # The line is: _total_mapcount -= HPAGE_PMD_NR
+          # Should be:   _total_mapcount -= HPAGE_PMD_NR;
+          sed -i 's/_total_mapcount -= HPAGE_PMD_NR$/_total_mapcount -= HPAGE_PMD_NR;/' "$HUGE_MEM_FILE"
+          echo "  Fixed missing semicolon in huge_memory.c"
+          # Verify
+          grep "_total_mapcount -= HPAGE_PMD_NR;" "$HUGE_MEM_FILE" && echo "  Fix verified"
         else
-          echo "  cpufreq_uag_main.c not found"
+          echo "  huge_memory.c not found"
         fi
 
         echo ""
-        echo "=== Fix 3: Remove UAG governor from build entirely ==="
-        # Alternative: Remove the UAG governor object file from the build
+        echo "=== Fix 3: Completely remove UAG governor from build ==="
+        # The UAG governor has undefined symbols that can't be easily fixed
+        # We'll completely remove it from the build by modifying the Kconfig and Makefile
+        
+        # Step 3a: Remove from kernel/uad/Makefile
         UAG_MAKEFILE="$GITHUB_WORKSPACE/kernel_source/kernel/uad/Makefile"
         if [ -f "$UAG_MAKEFILE" ]; then
-          # Comment out the line that adds cpufreq_uag.o to the build
-          sed -i 's/^obj-\$(CONFIG_CPU_FREQ_GOV_UAG)/# obj-$(CONFIG_CPU_FREQ_GOV_UAG)/g' "$UAG_MAKEFILE"
-          sed -i 's/^obj-\$(CONFIG_UAG_GOV)/# obj-$(CONFIG_UAG_GOV)/g' "$UAG_MAKEFILE"
-          echo "  Removed UAG governor from Makefile build"
+          echo "  Modifying $UAG_MAKEFILE..."
+          # Comment out ALL lines that reference cpufreq_uag or UAG
+          sed -i 's/^obj-.*cpufreq_uag/# obj- # DISABLED UAG/g' "$UAG_MAKEFILE"
+          sed -i 's/^obj-.*UAG_GOV/# obj- # DISABLED UAG/g' "$UAG_MAKEFILE"
+          sed -i 's/^cpufreq_uag-objs/# cpufreq_uag-objs # DISABLED UAG/g' "$UAG_MAKEFILE"
+          
+          # Show what was changed
+          echo "  Modified Makefile contents:"
+          cat "$UAG_MAKEFILE"
         else
-          echo "  kernel/uad/Makefile not found"
+          echo "  kernel/uad/Makefile not found - searching for it..."
+          find "$GITHUB_WORKSPACE/kernel_source" -name "Makefile" -path "*/uad/*" 2>/dev/null
+        fi
+        
+        # Step 3b: Also disable in the parent Makefile if it exists
+        PARENT_MK="$GITHUB_WORKSPACE/kernel_source/kernel/Makefile"
+        if [ -f "$PARENT_MK" ]; then
+          sed -i 's/^obj-.*uad/# obj- # DISABLED UAD/g' "$PARENT_MK"
+          echo "  Modified kernel/Makefile to disable uad subdirectory"
+        fi
+        
+        # Step 3c: Rename the source file to prevent compilation
+        UAG_SRC="$GITHUB_WORKSPACE/kernel_source/kernel/uad/cpufreq_uag_main.c"
+        if [ -f "$UAG_SRC" ]; then
+          mv "$UAG_SRC" "${UAG_SRC}.DISABLED"
+          echo "  Renamed cpufreq_uag_main.c to cpufreq_uag_main.c.DISABLED"
         fi
 
         echo ""
@@ -620,6 +632,9 @@ jobs:
         if [ -z "$FP_FILE" ]; then
           echo "WARNING: fp_driver.c not found — fingerprint driver may not be compiled"
         fi
+        
+        echo ""
+        echo "=== All compilation fixes applied ==="
 
 
     # ══════════════════════════════════════════════════════════════════════════
