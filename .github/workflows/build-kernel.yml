@@ -352,32 +352,24 @@ jobs:
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 7 — Install build dependencies
     # ══════════════════════════════════════════════════════════════════════════
-    - name: Install build dependencies
+        - name: Install dependencies
       run: |
         sudo apt-get update -qq
+        
+        # 1. Remove the corrupted bison info files that are crashing the trigger
+        sudo rm -f /usr/share/info/bison.info*
+        
+        # 2. Force a clean reinstall of bison
+        sudo apt-get install -y --reinstall bison
+        
+        # 3. Install the rest of the required dependencies
         sudo apt-get install -y \
-          bc bison build-essential ccache curl flex git kmod \
+          bc build-essential ccache curl flex git kmod \
           libelf-dev libssl-dev lz4 make python3 unzip zip zlib1g-dev \
           binutils-aarch64-linux-gnu \
           gcc-arm-linux-gnueabi \
           binutils-arm-linux-gnueabi
-          bc \
-          bison \
-          build-essential \
-          ccache \
-          curl \
-          flex \
-          git \
-          kmod \
-          libelf-dev \
-          libssl-dev \
-          lz4 \
-          make \
-          python3 \
-          unzip \
-          zip \
-          zlib1g-dev \
-          binutils-aarch64-linux-gnu
+
 
     # ══════════════════════════════════════════════════════════════════════════
     # STEP 8 — Download Clang r383902b1
